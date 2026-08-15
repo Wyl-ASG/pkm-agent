@@ -1,0 +1,80 @@
+# ==========================================
+# Python & Bytecode
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# ==========================================
+# Virtual Environments
+# ==========================================
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ==========================================
+# Environment Variables & Secrets
+# ==========================================
+.env
+.env.local
+.env.*.local
+*.env
+!.env.example
+/secrets/
+
+# ==========================================
+# Obsidian Vault Data & Sync State
+# ==========================================
+vault/
+vault_data/
+.obsidian/
+.vault_hashes.json
+
+# ==========================================
+# Vector Database & Persistent Storage
+# ==========================================
+qdrant_data/
+qdrant_dev_data/
+qdrant_storage/
+*.sqlite
+*.sqlite3
+*.db
+
+# ==========================================
+# Operating System & IDEs
+# ==========================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ==========================================
+# Testing, Coverage & Logs
+# ==========================================
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+logs/
+
+# ==========================================
+# Distribution & Packaging
+# ==========================================
+build/
+dist/
+*.egg-info/
+.eggs/
+.aiexclude
