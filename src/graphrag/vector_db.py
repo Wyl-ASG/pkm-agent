@@ -1,7 +1,10 @@
+"""Thread-safe Singleton vector database manager for Qdrant with dynamic collection sizing."""
+
 import asyncio
 import logging
 from pathlib import Path
 import threading
+import time
 from typing import Any
 import uuid
 from qdrant_client import QdrantClient, models
@@ -23,6 +26,7 @@ class QdrantVectorStore:
 
     _instance: "QdrantVectorStore | None" = None
     _lock: threading.Lock = threading.Lock()
+    _op_lock: threading.RLock = threading.RLock()
 
     def __new__(
         cls,
@@ -47,15 +51,7 @@ class QdrantVectorStore:
         in_memory: bool = False,
         storage_path: str | Path | None = None,
     ) -> None:
-        """Initialize shared Qdrant client once.
-
-        Args:
-            host: Qdrant host address. Defaults to settings.QDRANT_HOST.
-            port: Qdrant port. Defaults to settings.QDRANT_PORT.
-            collection_name: Target Qdrant collection name.
-            in_memory: Force in-memory mode (:memory:).
-            storage_path: Local directory path for embedded Qdrant storage mode.
-        """
+        """Initialize shared Qdrant client once."""
         if getattr(self, "_initialized", False):
             return
 
@@ -115,69 +111,83 @@ class QdrantVectorStore:
     def close(self) -> None:
         """Safely close Qdrant storage connection on shutdown."""
         with self._lock:
-            if self._client is not None:
-                try:
-                    self._client.close()
-                    logger.info("Closed Qdrant client storage connection")
-                except Exception as err:
-                    logger.debug("Error closing Qdrant client: %s", err)
-                self._client = None
-            self._initialized = False
-            QdrantVectorStore._instance = None
+            with self._op_lock:
+                if self._client is not None:
+                    try:
+                        self._client.close()
+                        logger.info("Closed Qdrant client storage connection")
+                    except Exception as err:
+                        logger.debug("Error closing Qdrant client: %s", err)
+                    self._client = None
+                self._initialized = False
+                QdrantVectorStore._instance = None
 
     def ensure_collection(self, vector_size: int = DEFAULT_VECTOR_SIZE) -> None:
-        """Ensure Qdrant collection exists with dense vector config and full-text payload index.
+        """Ensure Qdrant collection exists with the target vector dimension size."""
+        with self._op_lock:
+            try:
+                if self.client.collection_exists(self.collection_name):
+                    info = self.client.get_collection(self.collection_name)
+                    existing_size = None
+                    if info.config and info.config.params and info.config.params.vectors:
+                        vec_params = info.config.params.vectors
+                        if isinstance(vec_params, models.VectorParams):
+                            existing_size = vec_params.size
+                        elif isinstance(vec_params, dict) and "" in vec_params:
+                            existing_size = vec_params[""].size
 
-        Args:
-            vector_size: Size of dense embedding vectors. Defaults to 384.
-        """
-        try:
-            if not self.client.collection_exists(self.collection_name):
-                logger.info("Creating Qdrant collection '%s' (vector_size=%d)", self.collection_name, vector_size)
-                self.client.create_collection(
-                    collection_name=self.collection_name,
-                    vectors_config=models.VectorParams(
-                        size=vector_size,
-                        distance=models.Distance.COSINE,
-                    ),
-                )
+                    if existing_size is not None and existing_size != vector_size:
+                        logger.error(
+                            "Collection '%s' vector dimension mismatch (existing=%s, required=%d).",
+                            self.collection_name,
+                            existing_size,
+                            vector_size,
+                        )
+                        raise ValueError(
+                            f"Vector dimension mismatch: collection '{self.collection_name}' has size {existing_size} "
+                            f"but configured size is {vector_size}. Manually delete the collection or migrate data "
+                            f"before proceeding."
+                        )
 
-            # Create full-text payload index on 'content' field if running against remote server
-            if not self._storage_path and not self._in_memory and self._host != ":memory:":
-                try:
-                    self.client.create_payload_index(
+                if not self.client.collection_exists(self.collection_name):
+                    logger.info("Creating Qdrant collection '%s' (vector_size=%d)", self.collection_name, vector_size)
+                    self.client.create_collection(
                         collection_name=self.collection_name,
-                        field_name="content",
-                        field_schema=models.TextIndexParams(
-                            type=models.TextIndexType.TEXT,
-                            tokenizer=models.TokenizerType.WORD,
-                            lowercase=True,
+                        vectors_config=models.VectorParams(
+                            size=vector_size,
+                            distance=models.Distance.COSINE,
                         ),
                     )
-                    logger.info("Full-text payload index on 'content' field created for '%s'", self.collection_name)
-                except Exception as index_err:
-                    logger.debug("Payload index creation notice for '%s': %s", self.collection_name, index_err)
 
-        except UnexpectedResponse as err:
-            logger.error("Qdrant unexpected response while ensuring collection: %s", err)
-            raise
-        except Exception as err:
-            logger.exception("Error ensuring Qdrant collection '%s': %s", self.collection_name, err)
-            raise
+                # Create full-text payload index on 'content' field if running against remote server
+                if not self._storage_path and not self._in_memory and self._host != ":memory:":
+                    try:
+                        self.client.create_payload_index(
+                            collection_name=self.collection_name,
+                            field_name="content",
+                            field_schema=models.TextIndexParams(
+                                type=models.TextIndexType.TEXT,
+                                tokenizer=models.TokenizerType.WORD,
+                                lowercase=True,
+                            ),
+                        )
+                    except Exception as index_err:
+                        logger.debug("Payload index creation notice for '%s': %s", self.collection_name, index_err)
+
+            except UnexpectedResponse as err:
+                logger.error("Qdrant unexpected response while ensuring collection: %s", err)
+                raise
+            except Exception as err:
+                logger.exception("Error ensuring Qdrant collection '%s': %s", self.collection_name, err)
+                raise
 
     def upsert_documents(self, documents: list[dict[str, Any]]) -> bool:
-        """Upsert documents into Qdrant vector store.
-
-        Args:
-            documents: List of dicts containing 'vector', 'content', and optional 'id', 'metadata'.
-
-        Returns:
-            True if upsert succeeded, False otherwise.
-        """
+        """Upsert documents into Qdrant vector store with concurrency locking and retry resilience."""
         if not documents:
             return True
 
-        self.ensure_collection()
+        first_vec = documents[0].get("vector")
+        vec_dim = len(first_vec) if first_vec else DEFAULT_VECTOR_SIZE
 
         points: list[models.PointStruct] = []
         for idx, doc in enumerate(documents):
@@ -214,20 +224,71 @@ class QdrantVectorStore:
         if not points:
             return False
 
-        try:
-            self.client.upsert(
-                collection_name=self.collection_name,
-                points=points,
-            )
-            logger.info("Successfully upserted %d points into collection '%s'", len(points), self.collection_name)
-            return True
-        except Exception as err:
-            logger.exception("Failed to upsert points into Qdrant collection '%s': %s", self.collection_name, err)
+        with self._op_lock:
+            self.ensure_collection(vector_size=vec_dim)
+            max_retries = 3
+            for attempt in range(1, max_retries + 1):
+                try:
+                    self.client.upsert(
+                        collection_name=self.collection_name,
+                        points=points,
+                    )
+                    logger.info("Successfully upserted %d points into collection '%s'", len(points), self.collection_name)
+                    return True
+                except Exception as err:
+                    if attempt < max_retries:
+                        logger.warning(
+                            "Transient error upserting points to Qdrant (attempt %d/%d): %s; retrying...",
+                            attempt,
+                            max_retries,
+                            err,
+                        )
+                        time.sleep(0.2 * attempt)
+                    else:
+                        logger.exception("Failed to upsert points into Qdrant collection '%s' after %d attempts: %s", self.collection_name, max_retries, err)
+                        return False
             return False
 
-    def upsert_documents_sync(self, documents: list[dict[str, Any]]) -> bool:
-        """Synchronous alias for upsert_documents."""
-        return self.upsert_documents(documents)
+    def search_dense(
+        self,
+        query_vector: list[float],
+        top_k: int = 30,
+        filters: dict[str, Any] | None = None,
+        score_threshold: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Dense semantic vector similarity search."""
+        with self._op_lock:
+            self.ensure_collection(vector_size=len(query_vector))
+            try:
+                query_filter = None
+                if filters:
+                    conditions = []
+                    for k, v in filters.items():
+                        conditions.append(models.FieldCondition(key=k, match=models.MatchValue(value=v)))
+                    query_filter = models.Filter(must=conditions)
+
+                dense_response = self.client.query_points(
+                    collection_name=self.collection_name,
+                    query=query_vector,
+                    query_filter=query_filter,
+                    limit=top_k,
+                    score_threshold=score_threshold,
+                )
+                points = dense_response.points if hasattr(dense_response, "points") else dense_response
+
+                results = []
+                for p in points:
+                    results.append({
+                        "id": p.id,
+                        "score": getattr(p, "score", 0.0),
+                        "dense_score": getattr(p, "score", 0.0),
+                        "payload": p.payload or {},
+                        "content": (p.payload or {}).get("content", ""),
+                    })
+                return results
+            except Exception as err:
+                logger.exception("Error executing dense search in Qdrant: %s", err)
+                return []
 
     def hybrid_search(
         self,
@@ -236,95 +297,77 @@ class QdrantVectorStore:
         top_k: int = 5,
         score_threshold: float | None = None,
     ) -> list[dict[str, Any]]:
-        """Hybrid search combining dense vector similarity with payload text matching.
+        """Legacy hybrid search combining dense similarity with text matching via RRF."""
+        with self._op_lock:
+            self.ensure_collection(vector_size=len(query_vector))
+            try:
+                dense_hits = self.search_dense(query_vector=query_vector, top_k=top_k * 2, score_threshold=score_threshold)
 
-        Args:
-            query_text: Natural text query string for full-text payload match.
-            query_vector: Dense embedding vector for semantic search.
-            top_k: Maximum number of combined search results to return.
-            score_threshold: Optional score threshold for vector similarity.
+                text_hits: list[Any] = []
+                clean_query_text = query_text.strip()
+                if clean_query_text:
+                    text_filter = models.Filter(
+                        must=[
+                            models.FieldCondition(
+                                key="content",
+                                match=models.MatchText(text=clean_query_text),
+                            )
+                        ]
+                    )
+                    text_response = self.client.query_points(
+                        collection_name=self.collection_name,
+                        query=query_vector,
+                        query_filter=text_filter,
+                        limit=top_k * 2,
+                    )
+                    text_hits = text_response.points if hasattr(text_response, "points") else text_response
 
-        Returns:
-            List of result dictionaries containing id, score, dense_score, text_match flag, and payload.
-        """
-        self.ensure_collection(vector_size=len(query_vector))
+                # Reciprocal Rank Fusion
+                rrf_scores: dict[str | int, float] = {}
+                payload_map: dict[str | int, Any] = {}
+                k_constant = 60.0
 
-        try:
-            # 1. Dense vector search
-            dense_response = self.client.query_points(
-                collection_name=self.collection_name,
-                query=query_vector,
-                limit=top_k * 2,
-                score_threshold=score_threshold,
-            )
-            dense_hits = dense_response.points if hasattr(dense_response, "points") else dense_response
+                for rank, item in enumerate(dense_hits):
+                    pid = item["id"]
+                    rrf_scores[pid] = rrf_scores.get(pid, 0.0) + (1.0 / (k_constant + rank + 1))
+                    payload_map[pid] = item["payload"]
 
-            # 2. Text payload matching search
-            text_hits: list[Any] = []
-            clean_query_text = query_text.strip()
-            if clean_query_text:
-                text_filter = models.Filter(
-                    must=[
-                        models.FieldCondition(
-                            key="content",
-                            match=models.MatchText(text=clean_query_text),
-                        )
-                    ]
-                )
-                text_response = self.client.query_points(
-                    collection_name=self.collection_name,
-                    query=query_vector,
-                    query_filter=text_filter,
-                    limit=top_k * 2,
-                )
-                text_hits = text_response.points if hasattr(text_response, "points") else text_response
+                for rank, point in enumerate(text_hits):
+                    pid = point.id
+                    rrf_scores[pid] = rrf_scores.get(pid, 0.0) + (1.5 / (k_constant + rank + 1))
+                    if pid not in payload_map:
+                        payload_map[pid] = point.payload or {}
 
-            # 3. Reciprocal Rank Fusion (RRF) algorithm
-            rrf_scores: dict[str | int, float] = {}
-            point_map: dict[str | int, Any] = {}
-            dense_score_map: dict[str | int, float] = {}
-            text_matched_ids: set[str | int] = set()
-
-            k_constant = 60.0
-
-            for rank, point in enumerate(dense_hits):
-                pid = point.id
-                rrf_scores[pid] = rrf_scores.get(pid, 0.0) + (1.0 / (k_constant + rank + 1))
-                point_map[pid] = point
-                dense_score_map[pid] = getattr(point, "score", 0.0)
-
-            for rank, point in enumerate(text_hits):
-                pid = point.id
-                # Apply boost to points matching exact full-text payload criteria
-                rrf_scores[pid] = rrf_scores.get(pid, 0.0) + (1.5 / (k_constant + rank + 1))
-                point_map[pid] = point
-                text_matched_ids.add(pid)
-                if pid not in dense_score_map:
-                    dense_score_map[pid] = getattr(point, "score", 0.0)
-
-            # Sort by fused score descending
-            sorted_ids = sorted(rrf_scores.keys(), key=lambda pid: rrf_scores[pid], reverse=True)
-
-            results: list[dict[str, Any]] = []
-            for pid in sorted_ids[:top_k]:
-                point = point_map[pid]
-                results.append({
-                    "id": pid,
-                    "score": rrf_scores[pid],
-                    "dense_score": dense_score_map.get(pid, 0.0),
-                    "text_match": pid in text_matched_ids,
-                    "payload": point.payload or {},
-                })
-
-            return results
-
-        except Exception as err:
-            logger.exception("Failed to execute hybrid search in Qdrant: %s", err)
-            raise
+                sorted_ids = sorted(rrf_scores.keys(), key=lambda pid: rrf_scores[pid], reverse=True)
+                results = []
+                for pid in sorted_ids[:top_k]:
+                    payload = payload_map[pid]
+                    results.append({
+                        "id": pid,
+                        "score": rrf_scores[pid],
+                        "payload": payload,
+                        "content": payload.get("content", ""),
+                    })
+                return results
+            except Exception as err:
+                logger.exception("Failed to execute hybrid search in Qdrant: %s", err)
+                raise
 
     async def upsert_documents_async(self, documents: list[dict[str, Any]]) -> bool:
-        """Asynchronously upsert documents into Qdrant vector store."""
+        """Asynchronously upsert documents."""
         return await asyncio.to_thread(self.upsert_documents, documents)
+
+    async def search_dense_async(
+        self,
+        query_vector: list[float],
+        top_k: int = 30,
+        filters: dict[str, Any] | None = None,
+        score_threshold: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Asynchronously execute dense search."""
+        return await asyncio.to_thread(
+            self.search_dense, query_vector, top_k, filters, score_threshold
+        )
 
     async def hybrid_search_async(
         self,
@@ -333,7 +376,7 @@ class QdrantVectorStore:
         top_k: int = 5,
         score_threshold: float | None = None,
     ) -> list[dict[str, Any]]:
-        """Asynchronously execute hybrid search in Qdrant."""
+        """Asynchronously execute hybrid search."""
         return await asyncio.to_thread(
             self.hybrid_search, query_text, query_vector, top_k, score_threshold
         )
@@ -343,15 +386,7 @@ def get_vector_store(
     collection_name: str = DEFAULT_COLLECTION_NAME,
     storage_path: str | Path | None = None,
 ) -> QdrantVectorStore:
-    """Return the singleton instance of QdrantVectorStore.
-
-    Args:
-        collection_name: Target Qdrant collection name. Defaults to 'pkm_notes'.
-        storage_path: Optional path to embedded storage directory.
-
-    Returns:
-        Shared QdrantVectorStore singleton instance.
-    """
+    """Return singleton instance of QdrantVectorStore."""
     return QdrantVectorStore(
         collection_name=collection_name,
         storage_path=storage_path,

@@ -1,10 +1,13 @@
-"""Entry parser agent for turning raw text inputs into structured InterstitialEntry models with WikiLinks."""
+"""Entry parser agent for turning raw text inputs into structured InterstitialEntry models with grounded WikiLinks."""
 
 from datetime import datetime
 import logging
 import re
 from src.agents.models import InterstitialEntry
-from src.llm.antigravity_llm import AntigravityLLM
+from src.config import settings
+from src.graphrag.resolver import WikiLinkResolver
+from src.llm.base import LLMProvider
+from src.llm.factory import get_llm_provider
 
 logger = logging.getLogger(__name__)
 
@@ -48,13 +51,14 @@ CRITICAL INSTRUCTIONS FOR CONTENT FORMATTING & OBSIDIAN SYNTAX:
      NEVER omit the checkbox '- [ ]'.
    - Set 'due_date' to the due date 'YYYY-MM-DD'.
 
-6. TAGS & CATEGORIZATION:
+6. TAGS & CATEGORIZATION & MEMORY TYPE:
    - Extract all topic hashtags (e.g. '#aws', '#infrastructure', '#cloud', '#networking') into 'extracted_tags'.
    - Select an appropriate category (e.g. 'work', 'thought', 'task', 'journal', 'discovery', 'inbox').
+   - Classify 'memory_type' into: 'fact', 'observation', 'decision', 'task', or 'ai_inference'.
 
 7. ATOMIC NOTES & ZETTELKASTEN:
    - If input contains an architectural insight, standalone concept, or major decision requiring an independent note:
-     Set 'requires_atomic_note' = True, provide 'atomic_note_title', and write clean Markdown body content for 'atomic_note_content'.
+     Set 'requires_atomic_note' = True, provide 'atomic_note_title', 'atomic_note_confidence' (0.0 to 1.0), 'atomic_note_reason', and write clean Markdown body content for 'atomic_note_content'.
    - Otherwise, set 'requires_atomic_note' = False, 'atomic_note_title' = None, and 'atomic_note_content' = None.
 
 8. TIMESTAMP:
@@ -78,15 +82,13 @@ def normalize_obsidian_markdown(text: str) -> str:
     )
 
     # 2. Fix single-bracket aliased links: '[Actual Target|Alias]' -> '[[Actual Target|Alias]]'
-    # Avoid replacing if preceded or followed by square bracket
     normalized = re.sub(
-        r"(?<!\[)\[([A-Za-z0-9_\-\s\.\/]+)\|([^\]\n]+)\](?!\])",
+        r"(?<!\[)\[([^\[\]\n\|]+)\|([^\[\]\n]+)\](?!\])",
         r"[[\1|\2]]",
         normalized,
     )
 
     # 3. Fix unbracketed inline Dataview fields: e.g. 'category:: work' -> '[category:: work]'
-    # Ensure it's not already in [key:: value] or (key:: value)
     normalized = re.sub(
         r"(?<![\[\(])\b([a-zA-Z0-9_\-]+)::\s*([a-zA-Z0-9_\-\/]+)(?![\]\)])",
         r"[\1:: \2]",
@@ -94,29 +96,34 @@ def normalize_obsidian_markdown(text: str) -> str:
     )
 
     # 4. Fix single bracketed entities that should be WikiLinks:
-    # Match '[Some Note Title]' when not a checkbox [ ], [x], [X], callout [!NOTE], or Markdown link [text](url)
+    # Converts [Target] to [[Target]], while preserving markdown links [Title](url), tasks [ ], [x], callouts [!NOTE], dataview [k::v]
     def fix_single_bracket_link(match: re.Match) -> str:
         content = match.group(1).strip()
-        # Skip if checkbox or callout
-        if content in (" ", "x", "X", "/", "-") or content.startswith("!"):
+        if content in ("", " ", "x", "X", "/", "-") or content.startswith("!"):
             return match.group(0)
-        # Skip if Dataview inline field
         if "::" in content:
+            return match.group(0)
+        if content.startswith("^"):
+            return match.group(0)
+        # Preserve numeric citations like [1], [2] unless it's a date like 2026-08-15
+        if content.isdigit():
             return match.group(0)
         return f"[[{content}]]"
 
     normalized = re.sub(
-        r"(?<!\[)\[([A-Za-z0-9][A-Za-z0-9_\-\s\.\/]+)\](?![\(\]])",
+        r"(?<!\[)\[([^\[\]\n\|]+)\](?!\s*[\(\]])",
         fix_single_bracket_link,
         normalized,
     )
+
+    # 5. Fix accidental triple brackets or nested brackets: '[[[Note]]]' -> '[[Note]]'
+    normalized = re.sub(r"\[{3,}([^\[\]\n]+)\]{3,}", r"[[\1]]", normalized)
 
     return normalized
 
 
 def extract_wikilinks_from_text(text: str) -> list[str]:
     """Extract Obsidian WikiLink target note names from text, stripping aliases."""
-    # First normalize any single brackets
     normalized = normalize_obsidian_markdown(text)
     matches = re.findall(r"\[\[([^\]\|]+)(?:\|[^\]]+)?\]\]", normalized)
     return [m.strip() for m in matches if m.strip()]
@@ -140,39 +147,35 @@ def extract_dataview_fields_from_text(text: str) -> dict[str, str]:
 def enforce_task_syntax(content: str, timestamp_str: str, due_date: str | None = None) -> str:
     """Enforce strict Obsidian Tasks syntax: - [ ] {Task} ➕ {CreatedDate} 📅 {DueDate}."""
     date_part = timestamp_str.split(" ")[0] if " " in timestamp_str else timestamp_str[:10]
-    
-    # Extract any existing created and due dates from content if present
+
     created_match = re.search(r"➕\s*(\d{4}-\d{2}-\d{2})", content)
     due_match = re.search(r"📅\s*(\d{4}-\d{2}-\d{2})", content)
 
     created_date = created_match.group(1) if created_match else date_part
     final_due_date = due_match.group(1) if due_match else (due_date or date_part)
 
-    # Clean task body: remove leading bullets / checkboxes / spaces
     task_body = content.strip()
     task_body = re.sub(r"^[-*+]\s*(\[\s*[xX]?\s*\])?\s*", "", task_body)
-    
-    # Remove any trailing date markers so they aren't duplicated
     task_body = re.sub(r"➕\s*\d{4}-\d{2}-\d{2}", "", task_body)
     task_body = re.sub(r"📅\s*\d{4}-\d{2}-\d{2}", "", task_body)
     task_body = task_body.strip()
 
-    # Normalize WikiLinks in task body
     task_body = normalize_obsidian_markdown(task_body)
 
     return f"- [ ] {task_body} ➕ {created_date} 📅 {final_due_date}"
 
 
 class EntryParserAgent:
-    """Agent that parses raw user inputs into structured InterstitialEntry models with Obsidian WikiLinks."""
+    """Agent that parses raw user inputs into structured InterstitialEntry models with grounded WikiLinks."""
 
-    def __init__(self, llm: AntigravityLLM | None = None) -> None:
-        """Initialize EntryParserAgent with an optional custom AntigravityLLM instance.
-
-        Args:
-            llm: AntigravityLLM driver instance. Defaults to default AntigravityLLM.
-        """
-        self.llm = llm or AntigravityLLM()
+    def __init__(
+        self,
+        llm: LLMProvider | None = None,
+        resolver: WikiLinkResolver | None = None,
+    ) -> None:
+        """Initialize EntryParserAgent."""
+        self.llm = llm or get_llm_provider()
+        self.resolver = resolver or WikiLinkResolver()
 
     async def parse(
         self,
@@ -181,19 +184,12 @@ class EntryParserAgent:
         category_hint: str | None = None,
         existing_notes: list[str] | None = None,
     ) -> InterstitialEntry:
-        """Parse raw user input text into a validated InterstitialEntry model.
-
-        Args:
-            raw_text: Raw input string from Telegram message or interstitial journal entry.
-            timestamp: Optional timestamp string. Defaults to current system time formatted as 'YYYY-MM-DD HH:MM'.
-            category_hint: Optional hint for categorization.
-            existing_notes: Optional list of existing note titles from the Obsidian vault.
-
-        Returns:
-            Validated InterstitialEntry Pydantic model instance.
-        """
+        """Parse raw user input text into a validated InterstitialEntry model."""
         current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
         entry_timestamp = timestamp if timestamp else current_time_str
+
+        if existing_notes:
+            self.resolver.update_notes(existing_notes)
 
         user_prompt_parts = [
             f"Timestamp: {entry_timestamp}",
@@ -202,7 +198,7 @@ class EntryParserAgent:
             user_prompt_parts.append(f"Category Hint: {category_hint}")
 
         if existing_notes:
-            sampled_notes = existing_notes[:60]
+            sampled_notes = existing_notes[:80]
             notes_str = ", ".join([f"[[{n}]]" for n in sampled_notes])
             user_prompt_parts.append(f"Existing Obsidian Vault Notes to Prioritize Linking:\n{notes_str}")
 
@@ -221,41 +217,38 @@ class EntryParserAgent:
                 system_prompt=PARSER_SYSTEM_PROMPT,
             )
 
-            # Ensure timestamp is set
             if not entry.timestamp:
                 entry.timestamp = entry_timestamp
 
-            # 1. Normalize markdown syntax in entry content
+            # Normalize markdown syntax
             entry.content = normalize_obsidian_markdown(entry.content)
 
-            # 2. Ensure WikiLink targets in extracted_wikilinks have aliases stripped and cleaned
+            # Ground WikiLinks against existing notes
             extracted_from_content = extract_wikilinks_from_text(entry.content)
             all_links = set()
-            for link in entry.extracted_wikilinks:
+            for link in entry.extracted_wikilinks + extracted_from_content:
                 clean_link = link.replace("[[", "").replace("]]", "").replace("[", "").replace("]", "")
                 target = clean_link.split("|")[0].strip()
                 if target:
-                    all_links.add(target)
-            for link in extracted_from_content:
-                clean_target = link.split("|")[0].strip()
-                if clean_target:
-                    all_links.add(clean_target)
+                    canonical, score = self.resolver.resolve(target)
+                    all_links.add(canonical if canonical else target)
+
             entry.extracted_wikilinks = sorted(all_links)
 
-            # 3. Extract or preserve Dataview inline fields
+            # Extract Dataview fields
             inline_dv = extract_dataview_fields_from_text(entry.content)
             if inline_dv:
                 for k, v in inline_dv.items():
                     if k not in entry.dataview_fields:
                         entry.dataview_fields[k] = v
 
-            # 4. Extract or preserve block ID
+            # Extract block ID
             if not entry.block_id:
                 found_block = extract_block_id_from_text(entry.content)
                 if found_block:
                     entry.block_id = found_block
 
-            # 5. Defensive enforcement of Obsidian Tasks syntax if category is task
+            # Defensive enforcement of Obsidian Tasks syntax if category is task
             is_task = entry.category.lower().strip() in (
                 "task", "tasks", "priority", "priorities", "todo"
             )
@@ -265,7 +258,6 @@ class EntryParserAgent:
                     timestamp_str=entry.timestamp,
                     due_date=entry.due_date,
                 )
-                # Ensure due_date is synchronized
                 due_match = re.search(r"📅\s*(\d{4}-\d{2}-\d{2})", entry.content)
                 if due_match:
                     entry.due_date = due_match.group(1)
@@ -285,6 +277,14 @@ class EntryParserAgent:
     ) -> InterstitialEntry:
         """Synchronous wrapper for parse method."""
         import asyncio
-
         return asyncio.run(self.parse(raw_text, timestamp, category_hint, existing_notes))
 
+
+__all__ = [
+    "EntryParserAgent",
+    "normalize_obsidian_markdown",
+    "extract_wikilinks_from_text",
+    "extract_block_id_from_text",
+    "extract_dataview_fields_from_text",
+    "enforce_task_syntax",
+]

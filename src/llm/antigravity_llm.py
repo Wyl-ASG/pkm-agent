@@ -5,9 +5,12 @@ import json
 import logging
 import os
 import shutil
-import subprocess
 from typing import Any, TypeVar
 from pydantic import BaseModel
+
+from src.config import settings
+from src.llm.base import LLMProvider
+from src.utils.resources import resource_manager
 
 logger = logging.getLogger(__name__)
 
@@ -16,10 +19,10 @@ T = TypeVar("T", bound=BaseModel)
 
 def find_agy_executable(custom_path: str | None = None) -> str:
     """Find absolute path to agy CLI executable.
-    
+
     Args:
         custom_path: Optional explicit binary path or name.
-        
+
     Returns:
         String path to executable binary.
 
@@ -51,20 +54,20 @@ def find_agy_executable(custom_path: str | None = None) -> str:
 
     raise FileNotFoundError(
         "The 'agy' (Antigravity CLI) executable was not found in PATH or standard directories (~/.local/bin/agy, /usr/local/bin/agy, /opt/homebrew/bin/agy).\n"
-        "Note: If you are running inside a Docker container, 'agy' is a macOS host binary and cannot be executed inside Linux Docker.\n"
-        "To resolve this, run Qdrant in Docker ('docker compose up -d qdrant') and run the PKM app on your host machine ('uvicorn src.main:app --reload')."
+        "Note: If you are running inside a Docker container, 'agy' is a host binary and cannot be executed inside Linux Docker.\n"
+        "To resolve this, run Qdrant in Docker and run the PKM app on your host machine."
     )
 
 
-class AntigravityLLM:
-    """Wrapper for local antigravitycli (agy) executable for text and Pydantic structured output."""
+class AntigravityLLM(LLMProvider):
+    """Wrapper for local antigravitycli (agy) executable implementing LLMProvider with process management."""
 
     def __init__(
         self,
         binary_path: str | None = None,
         model: str | None = None,
         effort: str | None = None,
-        timeout: int = 300,
+        timeout: int | None = None,
     ) -> None:
         """Initialize AntigravityLLM client.
 
@@ -72,12 +75,12 @@ class AntigravityLLM:
             binary_path: Optional path to agy binary. Defaults to auto-discovery.
             model: Optional model identifier (e.g., 'flash', 'pro').
             effort: Optional reasoning effort ('low', 'medium', 'high').
-            timeout: Subprocess timeout in seconds. Defaults to 300.
+            timeout: Subprocess timeout in seconds. Defaults to settings.ANTIGRAVITY_TIMEOUT_SECONDS.
         """
-        self.binary_path = find_agy_executable(binary_path)
-        self.model = model
-        self.effort = effort
-        self.timeout = timeout
+        self.binary_path = find_agy_executable(binary_path or getattr(settings, "AGY_PATH", None))
+        self.model = model or getattr(settings, "LLM_MODEL", None)
+        self.effort = effort or getattr(settings, "LLM_EFFORT", None)
+        self.timeout = timeout or getattr(settings, "ANTIGRAVITY_TIMEOUT_SECONDS", 120)
 
     def _clean_markdown_code_block(self, text: str) -> str:
         """Strip markdown triple backtick fences if present in JSON text."""
@@ -86,7 +89,6 @@ class AntigravityLLM:
             lines = cleaned.splitlines()
             if len(lines) >= 2 and lines[-1].startswith("```"):
                 return "\n".join(lines[1:-1]).strip()
-            # If starting with ```json, remove first line
             if lines[0].startswith("```"):
                 return "\n".join(lines[1:]).strip()
         return cleaned
@@ -135,38 +137,52 @@ class AntigravityLLM:
             cmd.extend(["--effort", self.effort])
 
         logger.info("Executing agy CLI command for text generation")
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(),
-                timeout=self.timeout,
-            )
-
-            if process.returncode != 0:
-                err_msg = stderr.decode("utf-8", errors="replace")
-                logger.error("agy CLI command failed with exit code %d: %s", process.returncode, err_msg)
-                raise RuntimeError(f"agy CLI execution failed (exit code {process.returncode}): {err_msg}")
-
-            output_str = stdout.decode("utf-8", errors="replace")
+        async with resource_manager.antigravity_semaphore:
+            process = None
             try:
-                data = json.loads(output_str)
-                if isinstance(data, dict) and "response" in data:
-                    return str(data["response"]).strip()
-            except json.JSONDecodeError:
-                pass
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=self.timeout,
+                )
 
-            return output_str.strip()
+                if process.returncode != 0:
+                    err_msg = stderr.decode("utf-8", errors="replace")[:1000]
+                    logger.error("agy CLI command failed with exit code %d: %s", process.returncode, err_msg)
+                    raise RuntimeError(f"agy CLI execution failed (exit code {process.returncode}): {err_msg}")
 
-        except asyncio.TimeoutError:
-            logger.error("agy CLI command execution timed out after %d seconds", self.timeout)
-            raise TimeoutError(f"agy CLI execution timed out after {self.timeout} seconds")
-        except Exception as err:
-            logger.exception("Unexpected error during agy CLI text generation: %s", err)
-            raise
+                output_str = stdout.decode("utf-8", errors="replace")
+                try:
+                    data = json.loads(output_str)
+                    if isinstance(data, dict) and "response" in data:
+                        return str(data["response"]).strip()
+                except json.JSONDecodeError:
+                    pass
+
+                return output_str.strip()
+
+            except asyncio.TimeoutError:
+                if process:
+                    try:
+                        process.kill()
+                        await process.wait()
+                    except Exception:
+                        pass
+                logger.error("agy CLI command execution timed out after %d seconds", self.timeout)
+                raise TimeoutError(f"agy CLI execution timed out after {self.timeout} seconds")
+            except Exception as err:
+                if process and process.returncode is None:
+                    try:
+                        process.kill()
+                        await process.wait()
+                    except Exception:
+                        pass
+                logger.exception("Unexpected error during agy CLI text generation: %s", err)
+                raise
 
     async def generate_json(
         self,
@@ -206,55 +222,55 @@ class AntigravityLLM:
             cmd.extend(["--effort", self.effort])
 
         logger.info("Executing agy CLI command for structured JSON generation")
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(),
-                timeout=self.timeout,
-            )
+        async with resource_manager.antigravity_semaphore:
+            process = None
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=self.timeout,
+                )
 
-            if process.returncode != 0:
-                err_msg = stderr.decode("utf-8", errors="replace")
-                logger.error("agy CLI command failed with exit code %d: %s", process.returncode, err_msg)
-                raise RuntimeError(f"agy CLI execution failed (exit code {process.returncode}): {err_msg}")
+                if process.returncode != 0:
+                    err_msg = stderr.decode("utf-8", errors="replace")[:1000]
+                    logger.error("agy CLI command failed with exit code %d: %s", process.returncode, err_msg)
+                    raise RuntimeError(f"agy CLI execution failed (exit code {process.returncode}): {err_msg}")
 
-            output_str = stdout.decode("utf-8", errors="replace")
-            payload = self._extract_json_payload(output_str)
+                output_str = stdout.decode("utf-8", errors="replace")
+                payload = self._extract_json_payload(output_str)
 
-            if isinstance(payload, dict):
-                return schema_model.model_validate(payload)
-            elif isinstance(payload, str):
-                return schema_model.model_validate_json(payload)
-            else:
-                raise ValueError(f"Unexpected payload type from agy output: {type(payload)}")
+                if isinstance(payload, dict):
+                    return schema_model.model_validate(payload)
+                elif isinstance(payload, str):
+                    return schema_model.model_validate_json(payload)
+                else:
+                    raise ValueError(f"Unexpected payload type from agy output: {type(payload)}")
 
-        except asyncio.TimeoutError:
-            logger.error("agy CLI execution timed out after %d seconds", self.timeout)
-            raise TimeoutError(f"agy CLI execution timed out after {self.timeout} seconds")
-        except (json.JSONDecodeError, ValueError) as parse_err:
-            logger.exception("Failed to parse JSON response from agy CLI output: %s", parse_err)
-            raise
-        except Exception as err:
-            logger.exception("Unexpected error during agy CLI structured JSON generation: %s", err)
-            raise
+            except asyncio.TimeoutError:
+                if process:
+                    try:
+                        process.kill()
+                        await process.wait()
+                    except Exception:
+                        pass
+                logger.error("agy CLI execution timed out after %d seconds", self.timeout)
+                raise TimeoutError(f"agy CLI execution timed out after {self.timeout} seconds")
+            except (json.JSONDecodeError, ValueError) as parse_err:
+                logger.exception("Failed to parse JSON response from agy CLI output: %s", parse_err)
+                raise
+            except Exception as err:
+                if process and process.returncode is None:
+                    try:
+                        process.kill()
+                        await process.wait()
+                    except Exception:
+                        pass
+                logger.exception("Unexpected error during agy CLI structured JSON generation: %s", err)
+                raise
 
-    def generate_text_sync(
-        self,
-        prompt: str,
-        system_prompt: str | None = None,
-    ) -> str:
-        """Synchronous helper for text generation."""
-        return asyncio.run(self.generate_text(prompt, system_prompt))
 
-    def generate_json_sync(
-        self,
-        prompt: str,
-        schema_model: type[T],
-        system_prompt: str | None = None,
-    ) -> T:
-        """Synchronous helper for structured JSON generation."""
-        return asyncio.run(self.generate_json(prompt, schema_model, system_prompt))
+__all__ = ["AntigravityLLM", "find_agy_executable"]

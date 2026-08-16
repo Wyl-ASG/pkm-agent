@@ -256,8 +256,106 @@ def is_task_query_intent(text: str) -> bool:
     return False
 
 
+def format_obsidian_for_telegram(text: str) -> str:
+    """Format and polish raw Obsidian markdown into clean Telegram message markdown."""
+    if not text:
+        return text
+
+    # 1. Normalize obsidian markdown first (fix single brackets, dataview fields, etc.)
+    from src.agents.parser import normalize_obsidian_markdown
+    formatted = normalize_obsidian_markdown(text)
+
+    # 2. Replace horizontal rules with visual divider line
+    formatted = re.sub(r"^(?:---|\*\*\*|___)\s*$", "───────────────────────", formatted, flags=re.MULTILINE)
+
+    # 3. Convert markdown headers to clean styled headers for Telegram
+    # ### Heading -> 🔹 *Heading*
+    formatted = re.sub(r"^###\s+(.+)$", r"🔹 *\1*", formatted, flags=re.MULTILINE)
+    # ## Heading -> 📌 *Heading*
+    formatted = re.sub(r"^##\s+(.+)$", r"📌 *\1*", formatted, flags=re.MULTILINE)
+    # # Heading -> 🏆 *Heading*
+    formatted = re.sub(r"^#\s+(.+)$", r"🏆 *\1*", formatted, flags=re.MULTILINE)
+
+    # 4. Convert callouts to styled alert blocks
+    formatted = re.sub(r"^>\s*\[!NOTE\]\s*(.*)$", r"ℹ️ *Note: \1*", formatted, flags=re.MULTILINE)
+    formatted = re.sub(r"^>\s*\[!WARNING\]\s*(.*)$", r"⚠️ *Warning: \1*", formatted, flags=re.MULTILINE)
+    formatted = re.sub(r"^>\s*\[!TIP\]\s*(.*)$", r"💡 *Tip: \1*", formatted, flags=re.MULTILINE)
+    formatted = re.sub(r"^>\s*\[!IMPORTANT\]\s*(.*)$", r"❗ *Important: \1*", formatted, flags=re.MULTILINE)
+    formatted = re.sub(r"^>\s*\[!CAUTION\]\s*(.*)$", r"🛑 *Caution: \1*", formatted, flags=re.MULTILINE)
+
+    # 5. Fix bullet list markers for loose lines
+    formatted = re.sub(r"^\s+([A-Za-z0-9_\-\s]+:)\s*$", r"• *\1*", formatted, flags=re.MULTILINE)
+    formatted = re.sub(r"^\s{1,2}(?=[A-Za-z0-9_\[])", r"• ", formatted, flags=re.MULTILINE)
+
+    return formatted
+
+
+def convert_markdown_to_telegram_html(text: str) -> str:
+    """Convert Markdown / Obsidian text into safe Telegram-supported HTML.
+
+    Telegram HTML supports:
+      <b>bold</b>, <i>italic</i>, <code>inline code</code>, <pre>preformatted code</pre>,
+      <s>strikethrough</s>, <u>underline</u>, <blockquote>quote</blockquote>, <a href="...">link</a>.
+    All brackets [[WikiLink]] and special characters are preserved safely as text without entity parsing errors.
+    """
+    if not text:
+        return text
+
+    # Pre-process obsidian structure
+    text = format_obsidian_for_telegram(text)
+
+    # Extract code blocks to protect them from HTML escaping and tag transformations
+    code_blocks: list[str] = []
+    def save_code_block(match: re.Match) -> str:
+        code = match.group(2)
+        escaped_code = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        idx = len(code_blocks)
+        code_blocks.append(f"<pre><code>{escaped_code}</code></pre>")
+        return f"___CODE_BLOCK_{idx}___"
+
+    text = re.sub(r"```([a-zA-Z0-9_\-\+]*)\n([\s\S]*?)```", save_code_block, text)
+
+    # Extract inline code
+    inline_codes: list[str] = []
+    def save_inline_code(match: re.Match) -> str:
+        code = match.group(1)
+        escaped_code = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        idx = len(inline_codes)
+        inline_codes.append(f"<code>{escaped_code}</code>")
+        return f"___INLINE_CODE_{idx}___"
+
+    text = re.sub(r"`([^`\n]+)`", save_inline_code, text)
+
+    # HTML escape standard text
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    # Markdown links: [Title](url) -> <a href="url">Title</a>
+    text = re.sub(r"\[([^\]\n]+)\]\((https?:\/\/[^\s\)]+)\)", r'<a href="\2">\1</a>', text)
+
+    # Bold: **text** -> <b>text</b>
+    text = re.sub(r"\*\*([^\*\n]+)\*\*", r"<b>\1</b>", text)
+    # Bold: *text* -> <b>text</b>
+    text = re.sub(r"(?<![\w\*])\*([^\*\n]+)\*(?![\w\*])", r"<b>\1</b>", text)
+
+    # Italic: _text_ -> <i>text</i>
+    text = re.sub(r"(?<![\w_])_([^_\n]+)_(?![\w_])", r"<i>\1</i>", text)
+
+    # Strikethrough: ~~text~~ -> <s>text</s>
+    text = re.sub(r"~~([^~\n]+)~~", r"<s>\1</s>", text)
+
+    # Restore code blocks and inline code
+    for idx, block in enumerate(code_blocks):
+        text = text.replace(f"___CODE_BLOCK_{idx}___", block)
+    for idx, inline in enumerate(inline_codes):
+        text = text.replace(f"___INLINE_CODE_{idx}___", inline)
+
+    return text
+
+
 __all__ = [
     "format_pending_tasks_message",
     "format_daily_scheduled_message",
     "is_task_query_intent",
+    "format_obsidian_for_telegram",
+    "convert_markdown_to_telegram_html",
 ]

@@ -25,18 +25,32 @@ tags:
 TASK
 FROM #journal/daily
 WHERE file.name = this.file.name AND !completed
-🧠 Discoveries & Learning
-Linked Concepts
-Code snippet
+```
+
+---
+
+## 🧠 Discoveries & Learning
+
+### Linked Concepts
+```dataview
 LIST FROM [[#]]
 WHERE file.name = this.file.name
-📊 Summary & Metrics
-Code snippet
+```
+
+---
+
+## 📊 Summary & Metrics
+
+```dataview
 TABLE timestamp, category, content
 FROM #journal/daily
 WHERE file.name = this.file.name
 SORT timestamp ASC
-🔄 End of Day Review
+```
+
+---
+
+## 🔄 End of Day Review
 
 ---
 

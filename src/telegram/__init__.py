@@ -7,7 +7,9 @@ from src.telegram.client import (
     send_telegram_message,
 )
 from src.telegram.formatters import (
+    convert_markdown_to_telegram_html,
     format_daily_scheduled_message,
+    format_obsidian_for_telegram,
     format_pending_tasks_message,
     is_task_query_intent,
 )
@@ -36,4 +38,6 @@ __all__ = [
     "format_pending_tasks_message",
     "format_daily_scheduled_message",
     "is_task_query_intent",
+    "format_obsidian_for_telegram",
+    "convert_markdown_to_telegram_html",
 ]

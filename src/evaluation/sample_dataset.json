@@ -1,0 +1,109 @@
+[
+  {
+    "id": "q01",
+    "category": "technical_decision",
+    "question": "What did I decide about database architecture?",
+    "expected_sources": [
+      "Notes/Database Architecture.md",
+      "Daily Notes/2026-08-15.md"
+    ]
+  },
+  {
+    "id": "q02",
+    "category": "infrastructure",
+    "question": "How do I set up a web application on aws?",
+    "expected_sources": [
+      "Notes/AWS Web App Architecture.md",
+      "Notes/Infrastructure Setup.md"
+    ]
+  },
+  {
+    "id": "q03",
+    "category": "task_planning",
+    "question": "What are my active tasks for today?",
+    "expected_sources": [
+      "Daily Notes/2026-08-15.md"
+    ]
+  },
+  {
+    "id": "q04",
+    "category": "technical_decision",
+    "question": "What did I decide about authentication and session storage?",
+    "expected_sources": [
+      "Notes/Authentication.md",
+      "Notes/Security Architecture.md"
+    ]
+  },
+  {
+    "id": "q05",
+    "category": "concept",
+    "question": "What is our approach to distributed consensus and Raft?",
+    "expected_sources": [
+      "Notes/Distributed Systems.md",
+      "Notes/Raft Consensus.md"
+    ]
+  },
+  {
+    "id": "q06",
+    "category": "workflow",
+    "question": "How does the interstitial journaling workflow work?",
+    "expected_sources": [
+      "Notes/Interstitial Journaling.md",
+      "Notes/PKM Workflow.md"
+    ]
+  },
+  {
+    "id": "q07",
+    "category": "vector_search",
+    "question": "Why did we choose Qdrant over other vector databases?",
+    "expected_sources": [
+      "Notes/Vector Search Architecture.md",
+      "Notes/Qdrant Setup.md"
+    ]
+  },
+  {
+    "id": "q08",
+    "category": "meeting",
+    "question": "What were the key takeaways from the architecture review meeting?",
+    "expected_sources": [
+      "Daily Notes/2026-08-14.md",
+      "Notes/Architecture Review.md"
+    ]
+  },
+  {
+    "id": "q09",
+    "category": "performance",
+    "question": "What are the resource limits for our 2 vCPU 4GB server?",
+    "expected_sources": [
+      "Notes/Server Deployment.md",
+      "Notes/Production Hardening.md"
+    ]
+  },
+  {
+    "id": "q10",
+    "category": "git_sync",
+    "question": "How do we handle git conflicts in the vault safely?",
+    "expected_sources": [
+      "Notes/Git Synchronization.md",
+      "Notes/Vault Reliability.md"
+    ]
+  },
+  {
+    "id": "q11",
+    "category": "ai_agent",
+    "question": "How does the atomic note proposal and threshold work?",
+    "expected_sources": [
+      "Notes/Atomic Notes Strategy.md",
+      "Notes/PKM Agent Design.md"
+    ]
+  },
+  {
+    "id": "q12",
+    "category": "audio",
+    "question": "How are voice memos transcribed and stored?",
+    "expected_sources": [
+      "Notes/Multimodal Ingestion.md",
+      "Notes/Whisper Configuration.md"
+    ]
+  }
+]
