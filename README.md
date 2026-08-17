@@ -20,6 +20,7 @@
 - [Tech Stack](#tech-stack)
 - [Key Features](#key-features)
 - [Architecture Overview](#architecture-overview)
+- [Obsidian Vault & Git Setup](#obsidian-vault--git-setup)
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
 - [Configuration](#configuration)
@@ -37,6 +38,12 @@
   - [REST API Endpoints](#rest-api-endpoints)
 - [Retrieval Evaluation](#retrieval-evaluation)
 - [Deployment](#deployment)
+  - [Hosting Profile & Architectural Principles](#hosting-profile--architectural-principles)
+  - [Step-by-Step Cloud VPS Deployment Guide](#step-by-step-cloud-vps-deployment-guide)
+  - [Process Supervision (systemd)](#process-supervision-systemd)
+  - [Reverse Proxy & HTTPS Setup](#reverse-proxy--https-setup)
+  - [Telegram Webhook Activation & Verification](#telegram-webhook-activation--verification)
+  - [Production Operations & Maintenance](#production-operations--maintenance)
 - [Current Limitations](#current-limitations)
 - [Important Notes & Gotchas](#important-notes--gotchas)
 - [Testing](#testing)
@@ -192,6 +199,104 @@ flowchart TD
     end
 
     VAULT --> Indexing
+```
+
+[Back to top ↑](#pkm-ai-agent--second-brain-via-telegram)
+
+---
+
+## Obsidian Vault & Git Setup
+
+Before running the agent, you need a private Git repository for your Obsidian vault. The agent synchronizes bidirectionally with this repository using serialized Git operations (`pull --rebase`, `commit`, and `push`) via SSH.
+
+### 1. Create a Private Git Repository
+1. Log in to [GitHub](https://github.com/) (or your preferred Git host like GitLab/Gitea).
+2. Create a new repository (e.g. `my-obsidian-vault`).
+3. Set repository visibility to **Private** (recommended to keep your personal notes confidential).
+4. Leave "Initialize this repository with a README" unchecked if you have an existing local vault.
+
+### 2. Initialize Git in Your Local Obsidian Vault
+Open a terminal in your Obsidian vault directory on your computer:
+
+```bash
+# Navigate to your local Obsidian vault directory
+cd /path/to/your/obsidian-vault
+
+# Initialize a new Git repository
+git init -b main
+
+# Create a recommended .gitignore for Obsidian
+cat << 'EOF' > .gitignore
+# Obsidian workspace layout and local caches (prevents noisy merge conflicts)
+.obsidian/workspace.json
+.obsidian/workspace-mobile.json
+.obsidian/cache/
+.obsidian/graph.json
+.obsidian/hotkeys.json
+.obsidian/starred.json
+
+# OS & temporary metadata
+.DS_Store
+Thumbs.db
+.trash/
+
+# Lock files
+*.lock
+EOF
+
+# Stage, commit, and push your vault
+git add .
+git commit -m "Initial commit: Obsidian vault setup"
+git remote add origin git@github.com:<your-username>/my-obsidian-vault.git
+git push -u origin main
+```
+
+> **Why ignore `workspace.json`?** Obsidian constantly updates `workspace.json` with open tabs and active panes. Keeping it in `.gitignore` prevents merge conflicts between your desktop, mobile app, and the PKM agent while keeping note content, templates, and plugin configs tracked.
+
+### 3. Configure Obsidian Git Community Plugin (Optional but Recommended)
+To sync your vault seamlessly across desktop and mobile devices alongside the AI agent:
+1. In Obsidian, go to **Settings → Community plugins → Browse**.
+2. Search for and install **Obsidian Git**, then enable it.
+3. In **Obsidian Git settings**:
+   - Set **Vault backup interval (minutes)** to `5` or `10`.
+   - Enable **Auto Pull on startup**.
+   - Enable **Auto backup after pulling**.
+   - Ensure the pull strategy matches the agent's rebase behavior.
+
+### 4. Create a Dedicated SSH Deploy Key for the AI Agent
+For security isolation, generate a dedicated SSH key pair that only has access to this single vault repository (avoid using your personal master SSH key):
+
+```bash
+# Generate a dedicated ED25519 deploy key pair without a passphrase
+ssh-keygen -t ed25519 -C "pkm-agent-deploy-key" -f ./pkm_deploy_key -N ""
+```
+
+This creates two files:
+- `pkm_deploy_key` (Private key — keep this secure!)
+- `pkm_deploy_key.pub` (Public key — added to GitHub)
+
+**Register the public key on GitHub:**
+1. In your GitHub repository, navigate to **Settings → Deploy keys → Add deploy key**.
+2. **Title:** `PKM Agent Deploy Key`
+3. **Key:** Paste the contents of `pkm_deploy_key.pub`.
+4. **Important:** Check **"Allow write access"** so the agent can push daily notes and task completions.
+5. Click **Add key**.
+
+### 5. Install the Deploy Key in `pkm-agent`
+Copy the private key to the agent's `secrets/` directory:
+
+```bash
+# Inside the pkm-agent project directory
+mkdir -p secrets
+cp /path/to/pkm_deploy_key secrets/pkm_deploy_key
+chmod 600 secrets/pkm_deploy_key
+```
+
+Set `GIT_REPO_URL` and `SSH_KEY_PATH` in `.env.local`:
+```ini
+GIT_REPO_URL=git@github.com:<your-username>/my-obsidian-vault.git
+SSH_KEY_PATH=./secrets/pkm_deploy_key
+GIT_BRANCH=main
 ```
 
 [Back to top ↑](#pkm-ai-agent--second-brain-via-telegram)

@@ -30,7 +30,6 @@ venv.bak/
 # ==========================================
 # Obsidian Vault Data & Sync State
 # ==========================================
-vault/
 vault_data/
 .obsidian/
 .vault_hashes.json
