@@ -1,0 +1,51 @@
+# ==========================================
+# AI Context Exclusion Rules (.aiexclude)
+# Prevents AI tools & agents from indexing
+# sensitive, private, or binary directories.
+# ==========================================
+
+# Secrets & Credentials
+.env
+.env.local
+.env.*.local
+*.env
+*.pem
+*.key
+*.cert
+id_rsa*
+id_ed25519*
+/secrets/
+
+# Private Obsidian Vault Data
+vault/
+vault_data/
+.obsidian/
+.vault_hashes.json
+
+# Vector Database & Storage
+qdrant_data/
+qdrant_dev_data/
+qdrant_storage/
+*.sqlite
+*.sqlite3
+*.db
+
+# Virtual Environments & Packages
+.venv/
+venv/
+env/
+site-packages/
+
+# Python Cache & Logs
+__pycache__/
+*.py[cod]
+*.log
+logs/
+.pytest_cache/
+.coverage
+
+# Git & System Files
+.git/
+.DS_Store
+.idea/
+.vscode/

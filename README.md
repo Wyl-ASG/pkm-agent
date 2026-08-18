@@ -12,9 +12,32 @@
 
 ---
 
+## ⚡ TL;DR
+
+A self-hosted Telegram bot that acts as your AI second brain, backed by your Obsidian vault.
+
+- **Capture** — send any text or voice memo to Telegram; it's parsed into a structured Obsidian note and committed to your vault via Git.
+- **Retrieve** — `/ask` runs a multi-stage hybrid search (dense + BM25 + WikiLink graph expansion) and answers with block-level source citations.
+- **Manage** — `/tasks` returns your pending tasks with inline checkboxes; a daily briefing arrives automatically each morning.
+- **Runs on a cheap VPS** — a 2 vCPU / 4 GB Tencent Cloud / DigitalOcean instance is sufficient. No Docker, no GPU.
+
+**Quick start (cloud VPS):**
+```bash
+sudo apt install -y python3 python3-pip python3-venv git curl
+git clone https://github.com/Wyl-ASG/pkm-agent.git && cd pkm-agent
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env.local   # fill in tokens + vault SSH key
+python3 main.py health       # verify everything is wired up
+```
+Then set up [systemd](#process-supervision-systemd) + [Nginx + HTTPS](#reverse-proxy--https-setup) + [Telegram webhook](#telegram-webhook-activation--verification) — the full guide is in [Deployment](#deployment).
+
+---
+
 
 ## 📑 Table of Contents
 
+- [⚡ TL;DR](#️-tldr)
 - [Why I Built This](#why-i-built-this)
 - [What It Demonstrates](#what-it-demonstrates)
 - [Tech Stack](#tech-stack)
@@ -542,22 +565,226 @@ The evaluation engine runs each query through the retrieval pipeline and compute
 
 ## Deployment
 
-### Local Server / VPS (Production)
+### Hosting Profile & Architectural Principles
 
-The default production profile is designed for a **2 vCPU / 4 GB RAM VPS** (`APP_PROFILE=production-small`), utilizing lazy model loading and serialized background maintenance to keep resource usage manageable. Run with a single Uvicorn worker:
-
-```bash
-uvicorn src.main:app --host 0.0.0.0 --port 8000 --workers 1
-```
+The default production profile is designed for a **2 vCPU / 4 GB RAM VPS**, utilizing lazy model loading and serialized background maintenance to keep resource usage manageable.
 
 > **Why Docker is Not Used:** The agent runs directly on the host machine because it drives the local `agy` (Antigravity) CLI binary as a subprocess and utilizes embedded on-disk Qdrant storage (`./qdrant_storage`). Running natively on the host eliminates container-in-container execution complexity with `agy`, simplifies SSH deploy-key handling for Git sync, and avoids container memory overhead on a low-resource VPS.
 
 > **Single-Worker Requirement:** The application uses in-process singletons for embedded Qdrant, faster-whisper, and in-memory BM25/Knowledge Graph indices. Running multiple workers will create redundant in-memory indices and load multiple copies of ML models into RAM.
 
-**Recommended VPS Setup:**
-1. Configure **Nginx** or **Caddy** as a reverse proxy with TLS termination (Telegram webhooks require valid HTTPS).
-2. Use **systemd** or **supervisord** for process supervision and auto-restart on failure.
-3. Keep `secrets/pkm_deploy_key` on the server filesystem with strict `chmod 600` permissions.
+---
+
+### Step-by-Step Cloud VPS Deployment Guide
+
+This guide covers a full deployment on a fresh Ubuntu VPS (tested on Tencent Cloud Lighthouse / CVM Ubuntu 22.04).
+
+#### 1. System Prerequisites
+
+SSH into your VPS and install required system packages:
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-pip python3-venv git curl ufw
+```
+
+#### 2. Clone the Repository
+
+```bash
+cd ~
+git clone https://github.com/Wyl-ASG/pkm-agent.git
+cd pkm-agent
+```
+
+#### 3. Create a Python Virtual Environment
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+#### 4. Install the SSH Deploy Key
+
+Copy your private SSH deploy key (generated during [Vault & Git Setup](#obsidian-vault--git-setup)) to the server's `secrets/` directory:
+
+```bash
+mkdir -p secrets
+# Copy your private key to the server, then:
+chmod 600 secrets/pkm_deploy_key
+```
+
+> **Tip:** Use `scp` or paste the key contents via `vi secrets/pkm_deploy_key` from your local machine.
+
+#### 5. Configure Environment Variables
+
+```bash
+cp .env.example .env.local
+vi .env.local   # Fill in all required values — see Configuration section
+```
+
+At minimum, set: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_SECRET_TOKEN`, `ALLOWED_TELEGRAM_USER_IDS`, `GIT_REPO_URL`, `SSH_KEY_PATH=./secrets/pkm_deploy_key`.
+
+#### 6. Verify Installation
+
+```bash
+source .venv/bin/activate   # If not already active
+python3 main.py health
+```
+
+All components should report healthy. If `LLM_PROVIDER=antigravity`, ensure `agy` is installed (see step 7).
+
+#### 7. Install the Antigravity CLI (`agy`)
+
+If you are using the default `antigravity` LLM provider, install the `agy` CLI:
+
+```bash
+curl -fsSL https://antigravity.google/cli/install.sh | bash
+# Reload shell or open a new session for agy to be available in PATH
+```
+
+Verify with `agy --version` after reopening your shell or rebooting.
+
+---
+
+### Process Supervision (systemd)
+
+Create a systemd service to keep the agent running persistently and restart it automatically on failure or reboot:
+
+```bash
+sudo vi /etc/systemd/system/pkm-agent.service
+```
+
+Paste the following unit file (adjust paths if your username is not `ubuntu`):
+
+```ini
+[Unit]
+Description=PKM AI Agent
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/pkm-agent
+Environment="PATH=/home/ubuntu/pkm-agent/.venv/bin:/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/home/ubuntu/pkm-agent/.venv/bin/python3 main.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start the service:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable pkm-agent
+sudo systemctl start pkm-agent
+sudo systemctl status pkm-agent
+```
+
+Check live logs at any time with:
+
+```bash
+journalctl -u pkm-agent -f -n 100
+```
+
+---
+
+### Reverse Proxy & HTTPS Setup
+
+Telegram requires a **valid HTTPS endpoint** for webhooks. Use Nginx as a reverse proxy with TLS termination via Let's Encrypt.
+
+> **sslip.io for Easy HTTPS:** If your VPS doesn't have a registered domain, use [sslip.io](https://sslip.io) — a free wildcard DNS service that maps `<YOUR_IP>.sslip.io` to your IP. Let's Encrypt can then issue a free certificate for that hostname. Example: `1.2.3.4.sslip.io`.
+
+#### 1. Install Nginx
+
+```bash
+sudo apt update
+sudo apt install -y nginx
+```
+
+#### 2. Create the Nginx Site Config
+
+```bash
+sudo tee /etc/nginx/sites-available/pkm-agent > /dev/null << 'EOF'
+server {
+    listen 80;
+    server_name <YOUR_IP>.sslip.io;   # Replace with your actual hostname
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 300s;
+        proxy_connect_timeout 75s;
+    }
+}
+EOF
+```
+
+#### 3. Enable the Site
+
+```bash
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo ln -s /etc/nginx/sites-available/pkm-agent /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+#### 4. Obtain a Free TLS Certificate with Certbot
+
+```bash
+sudo apt install -y certbot python3-certbot-nginx
+sudo certbot --nginx -d <YOUR_IP>.sslip.io
+```
+
+Certbot will automatically update your Nginx config for HTTPS and set up auto-renewal. After this step your agent is reachable at `https://<YOUR_IP>.sslip.io`.
+
+---
+
+### Telegram Webhook Activation & Verification
+
+Register your HTTPS endpoint with Telegram so the bot can receive messages:
+
+```bash
+curl -X POST "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/setWebhook" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://<YOUR_IP>.sslip.io/webhook/telegram",
+    "secret_token": "<YOUR_TELEGRAM_SECRET_TOKEN>",
+    "drop_pending_updates": true
+  }'
+```
+
+Verify the webhook is registered correctly:
+
+```bash
+curl -s "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getWebhookInfo"
+```
+
+Confirm the agent is reachable locally:
+
+```bash
+curl -s "http://127.0.0.1:8000/health"
+```
+
+---
+
+### Production Operations & Maintenance
+
+| Task | Command |
+|---|---|
+| View live logs | `journalctl -u pkm-agent -f -n 100` |
+| Restart agent | `sudo systemctl restart pkm-agent` |
+| Check agent status | `sudo systemctl status pkm-agent` |
+| Reload Nginx config | `sudo nginx -t && sudo systemctl reload nginx` |
+| Trigger vault reindex | `curl -X POST http://127.0.0.1:8000/vault/reindex` |
+| Force full reindex | `curl -X POST "http://127.0.0.1:8000/vault/reindex?force=true"` |
+| Check health endpoint | `curl -s http://127.0.0.1:8000/health` |
 
 [Back to top ↑](#pkm-ai-agent--second-brain-via-telegram)
 

@@ -78,4 +78,3 @@ build/
 dist/
 *.egg-info/
 .eggs/
-.aiexclude
