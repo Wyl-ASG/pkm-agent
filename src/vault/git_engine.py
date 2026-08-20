@@ -121,6 +121,87 @@ class GitEngine:
         except Exception as err:
             logger.debug("Rebase abort cleanup notice: %s", err)
 
+    def _repair_broken_head(self) -> bool:
+        """Detect and repair dangling or missing HEAD commit objects in the Git repository."""
+        try:
+            self.repo.git.rev_parse("--verify", "HEAD")
+            return True
+        except Exception as err:
+            logger.warning("Local HEAD reference is invalid or points to missing commit: %s. Attempting repair...", err)
+
+        # 1. If remote exists, attempt to fetch and point HEAD to origin/branch
+        if self.repo.remotes:
+            try:
+                origin_name = "origin" if "origin" in [r.name for r in self.repo.remotes] else self.repo.remotes[0].name
+                logger.info("Fetching from remote '%s' to restore object history...", origin_name)
+                self.repo.git.fetch(origin_name)
+                remote_ref = f"{origin_name}/{self.branch}"
+                try:
+                    self.repo.git.rev_parse("--verify", remote_ref)
+                    logger.info("Resetting HEAD to valid remote reference '%s'...", remote_ref)
+                    self.repo.git.reset("--soft", remote_ref)
+                    return True
+                except Exception:
+                    logger.warning("Remote reference '%s' not found or invalid.", remote_ref)
+            except Exception as fetch_err:
+                logger.error("Failed fetching from remote during HEAD repair: %s", fetch_err)
+
+        # 2. If remote fetch didn't fix it, unlink the broken ref file so git treats repo as initial commit state
+        try:
+            head_ref_file = Path(self.repo.git_dir) / "refs" / "heads" / self.branch
+            if head_ref_file.exists():
+                logger.warning("Deleting corrupted/orphaned ref file: %s", head_ref_file)
+                head_ref_file.unlink()
+            self.repo.git.symbolic_ref("HEAD", f"refs/heads/{self.branch}")
+            logger.info("Successfully reset HEAD symbolic ref to 'refs/heads/%s'", self.branch)
+            return True
+        except Exception as ref_err:
+            logger.error("Failed resetting HEAD ref file: %s", ref_err)
+            return False
+
+    def _has_changes_to_commit(self) -> bool:
+        """Check if there are staged or unstaged changes in the repo via git status."""
+        try:
+            status_out = self.repo.git.status("--porcelain").strip()
+            return len(status_out) > 0
+        except Exception:
+            try:
+                return self.repo.is_dirty(untracked_files=True)
+            except Exception:
+                return True
+
+    def _safe_commit(self, commit_message: str) -> bool:
+        """Commit staged changes using native git CLI with automatic repair on broken HEAD."""
+        self._repair_broken_head()
+        if not self._has_changes_to_commit():
+            logger.info("No uncommitted changes in vault repository; skipped commit.")
+            return True
+
+        try:
+            out = self.repo.git.commit("-m", commit_message)
+            logger.info("Committed changes: %s (output: %s)", commit_message, out.strip().replace("\n", " "))
+            return True
+        except GitCommandError as err:
+            err_msg = str(err).lower()
+            if "nothing to commit" in err_msg or "clean" in err_msg:
+                logger.info("No changes to commit in vault repository.")
+                return True
+            logger.warning("Git commit command failed: %s. Attempting HEAD repair and retry...", err)
+            if self._repair_broken_head():
+                self.repo.git.add(A=True)
+                if self._has_changes_to_commit():
+                    try:
+                        out = self.repo.git.commit("-m", commit_message)
+                        logger.info("Committed changes after HEAD repair: %s", commit_message)
+                        return True
+                    except Exception as retry_err:
+                        logger.error("Git commit failed after HEAD repair retry: %s", retry_err)
+                        return False
+            return False
+        except Exception as err:
+            logger.exception("Unexpected error during git commit: %s", err)
+            return False
+
     def get_conflicting_files(self) -> list[str]:
         """Detect unmerged or conflicting files in working tree."""
         try:
@@ -132,10 +213,18 @@ class GitEngine:
     def check_working_tree(self) -> dict[str, Any]:
         """Check working tree status (untracked files, modified files, conflicts)."""
         repo = self.repo
+        try:
+            is_dirty = self._has_changes_to_commit()
+            untracked = repo.untracked_files
+            modified = [item.a_path for item in repo.index.diff(None)]
+        except Exception:
+            is_dirty = True
+            untracked = []
+            modified = []
         return {
-            "is_dirty": repo.is_dirty(untracked_files=True),
-            "untracked": repo.untracked_files,
-            "modified": [item.a_path for item in repo.index.diff(None)],
+            "is_dirty": is_dirty,
+            "untracked": untracked,
+            "modified": modified,
             "conflicts": self.get_conflicting_files(),
         }
 
@@ -160,6 +249,7 @@ class GitEngine:
                 origin_name = "origin" if "origin" in remote_names else remote_names[0]
 
                 self._abort_rebase_if_in_progress(self.repo)
+                self._repair_broken_head()
 
                 logger.info(
                     "Pulling latest changes from remote '%s' branch '%s' (rebase=%s, autostash=%s)",
@@ -206,6 +296,7 @@ class GitEngine:
             except Exception as err:
                 logger.exception("Unexpected error during git pull: %s", err)
                 return False
+
     def _recover_mass_deletion(self) -> bool:
         """Detect mass deletion and restore files from HEAD to trigger re-index."""
         try:
@@ -244,17 +335,11 @@ class GitEngine:
                             rel_paths.append(str(path_obj.relative_to(self.vault_path)))
                         else:
                             rel_paths.append(str(path_obj))
-                    self.repo.index.add(rel_paths)
+                    self.repo.git.add(rel_paths)
                 else:
                     self.repo.git.add(A=True)
 
-                if not self.repo.is_dirty(untracked_files=True):
-                    logger.info("No uncommitted changes in vault repository; skipped commit.")
-                    return True
-
-                commit_obj = self.repo.index.commit(message)
-                logger.info("Committed changes to vault repository: '%s' (%s)", message, commit_obj.hexsha)
-                return True
+                return self._safe_commit(message)
             except GitCommandError as err:
                 logger.error("Git commit failed: %s", err)
                 return False
@@ -271,6 +356,7 @@ class GitEngine:
         with self._thread_lock:
             try:
                 self.repo.git.update_environment(GIT_SSH_COMMAND=self.ssh_command)
+                self._repair_broken_head()
                 if not self.repo.remotes:
                     logger.info("No remote repositories configured for push; skipping.")
                     return True
@@ -313,11 +399,10 @@ class GitEngine:
                     self._recover_mass_deletion()
                 self.repo.git.add(A=True)
 
-                if self.repo.is_dirty(untracked_files=True):
-                    self.repo.index.commit(commit_message)
-                    logger.info("Committed changes: %s", commit_message)
-                else:
-                    logger.info("No changes to commit in vault.")
+                commit_ok = self._safe_commit(commit_message)
+                if not commit_ok:
+                    logger.error("Failed to commit changes in vault repository.")
+                    return False
 
                 if not self.repo.remotes:
                     logger.info("No remote repositories configured for push; skipping push.")

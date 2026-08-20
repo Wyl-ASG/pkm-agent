@@ -59,3 +59,28 @@ def test_git_engine_conflict_and_rebase_abort(tmp_path):
     # Calling abort rebase when no rebase in progress should be a safe no-op
     engine._abort_rebase_if_in_progress(engine.repo)
     assert not engine.repo.is_dirty(untracked_files=True)
+
+
+def test_git_engine_repair_broken_head(tmp_path):
+    """Test that git engine recovers gracefully when HEAD points to a non-existent missing SHA commit."""
+    vault_dir = tmp_path / "vault_broken_head"
+    vault_dir.mkdir()
+
+    engine = GitEngine(vault_path=vault_dir)
+    (vault_dir / "Note1.md").write_text("Hello", encoding="utf-8")
+    engine.commit_sync("Initial commit")
+
+    # Manually corrupt the branch ref file to point to a non-existent commit SHA
+    fake_sha = "3f4ff950f915e15c5a6b3938bcf743da174ea32f"
+    branch_ref_file = vault_dir / ".git" / "refs" / "heads" / engine.branch
+    branch_ref_file.write_text(fake_sha + "\n", encoding="utf-8")
+
+    # Verify that repair handles the corrupted HEAD ref file
+    repaired = engine._repair_broken_head()
+    assert repaired is True
+
+    # Now add a new file and commit - should succeed cleanly without crashing on missing SHA
+    (vault_dir / "Note2.md").write_text("World", encoding="utf-8")
+    res = engine.commit_sync("Commit after broken HEAD repair")
+    assert res is True
+
