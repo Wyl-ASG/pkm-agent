@@ -578,12 +578,14 @@ async def process_telegram_reset_db(chat_id: int) -> None:
             import shutil
             import os
             from src.config import settings
-            vault_path = settings.VAULT_PATH
+            vault_path = Path(settings.VAULT_PATH).resolve()
             
             allowed_items = {".obsidian", "templates", "dashboard.md", ".gitignore", ".git"}
             
             def _wipe_vault() -> int:
                 count = 0
+                if not vault_path.exists():
+                    return 0
                 for item in vault_path.iterdir():
                     if item.name.lower() not in allowed_items:
                         if item.is_dir():
