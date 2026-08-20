@@ -53,7 +53,7 @@ class GitEngine:
         self.branch = branch or settings.GIT_BRANCH
         self.ssh_key_path = ssh_key_path or getattr(settings, "SSH_KEY_PATH", None)
         self._repo: git.Repo | None = None
-        self._thread_lock = threading.Lock()
+        self._thread_lock = threading.RLock()
         self._async_lock: asyncio.Lock | None = None
 
     def _get_async_lock(self) -> asyncio.Lock:
@@ -283,7 +283,10 @@ class GitEngine:
                     if 'fetch first' in str(e) or 'non-fast-forward' in str(e):
                         logger.warning("Git push rejected (fetch first). Pulling and retrying...")
                         try:
-                            self.repo.git.pull("--rebase", "--autostash", "origin", self.branch)
+                            pull_ok = self.pull_sync(rebase=True, autostash=True)
+                            if not pull_ok:
+                                logger.error("Git pull failed during push fallback.")
+                                return False
                             res = self.repo.git.push("origin", self.branch)
                             logger.info("Git push output after pull: %s", res)
                             return True
@@ -328,7 +331,10 @@ class GitEngine:
                     if 'fetch first' in str(e) or 'non-fast-forward' in str(e):
                         logger.warning("Git push rejected (fetch first). Pulling and retrying...")
                         try:
-                            self.repo.git.pull("--rebase", "--autostash", "origin", self.branch)
+                            pull_ok = self.pull_sync(rebase=True, autostash=True)
+                            if not pull_ok:
+                                logger.error("Git pull failed during push fallback.")
+                                return False
                             res = self.repo.git.push("origin", self.branch)
                             logger.info("Git push output after pull: %s", res)
                             return True
