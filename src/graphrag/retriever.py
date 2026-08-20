@@ -214,9 +214,10 @@ class HybridRetriever:
                 )
                 neighbor_titles.update(nb)
 
-            # Find matching chunks for neighbor titles from chunk cache
+            # Find matching chunks for neighbor titles from up-to-date BM25 documents
             existing_ids = {str(c.get("id")) for c in fused_candidates}
-            for nid, chunk in self._all_chunks_cache.items():
+            for chunk in self.bm25_index.documents:
+                nid = str(chunk.get("id"))
                 if nid not in existing_ids:
                     payload = chunk.get("metadata", chunk.get("payload", {}))
                     chunk_title = payload.get("title") or payload.get("file_name", "").replace(".md", "")

@@ -125,7 +125,19 @@ class WikiLinkResolver:
         best_candidate: str | None = None
         best_score = 0.0
 
-        for note in self.existing_notes:
+        def _fast_filter(term: str) -> list[str]:
+            term_words = set(re.findall(r"\w+", term.lower()))
+            if not term_words:
+                return self.existing_notes
+            filtered = []
+            for note in self.existing_notes:
+                note_words = set(re.findall(r"\w+", note.lower()))
+                if term_words.intersection(note_words):
+                    filtered.append(note)
+            return filtered if len(filtered) > 0 else self.existing_notes
+
+        candidates = _fast_filter(clean_term)
+        for note in candidates:
             score = self.score_candidate(clean_term, note)
             if score > best_score:
                 best_score = score

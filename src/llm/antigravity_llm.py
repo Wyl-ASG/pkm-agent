@@ -127,7 +127,7 @@ class AntigravityLLM(LLMProvider):
         cmd = [
             self.binary_path,
             "--print",
-            combined_prompt,
+            "-",
             "--output-format",
             "json",
         ]
@@ -142,11 +142,12 @@ class AntigravityLLM(LLMProvider):
             try:
                 process = await asyncio.create_subprocess_exec(
                     *cmd,
+                    stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
                 stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
+                    process.communicate(input=combined_prompt.encode("utf-8")),
                     timeout=self.timeout,
                 )
 
@@ -160,8 +161,8 @@ class AntigravityLLM(LLMProvider):
                     data = json.loads(output_str)
                     if isinstance(data, dict) and "response" in data:
                         return str(data["response"]).strip()
-                except json.JSONDecodeError:
-                    pass
+                except json.JSONDecodeError as err:
+                    logger.warning("LLM generated invalid JSON format. Falling back to raw string. Error: %s", err)
 
                 return output_str.strip()
 
@@ -210,7 +211,7 @@ class AntigravityLLM(LLMProvider):
         cmd = [
             self.binary_path,
             "--print",
-            combined_prompt,
+            "-",
             "--json-schema",
             schema_json,
             "--output-format",
@@ -227,11 +228,12 @@ class AntigravityLLM(LLMProvider):
             try:
                 process = await asyncio.create_subprocess_exec(
                     *cmd,
+                    stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
                 stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
+                    process.communicate(input=combined_prompt.encode("utf-8")),
                     timeout=self.timeout,
                 )
 

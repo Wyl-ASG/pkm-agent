@@ -86,6 +86,9 @@ async def _send_single_telegram_chunk(
         response = await client.post(url, json=payload)
         if response.status_code == 200:
             return True
+        if response.status_code != 400:
+            logger.error("API error %d", response.status_code)
+            return False
 
         logger.warning(
             "Telegram HTML parse failed (%d: %s); retrying chunk with Markdown.",
@@ -219,6 +222,8 @@ async def edit_telegram_message_text(
     from src.telegram.formatters import convert_markdown_to_telegram_html
 
     url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/editMessageText"
+    if len(text) > 4000:
+        text = text[:4000] + "...\n\n[Truncated]"
     html_text = convert_markdown_to_telegram_html(text)
     payload: dict[str, Any] = {
         "chat_id": chat_id,
@@ -272,18 +277,21 @@ async def download_telegram_file(file_id: str) -> Path | None:
                 logger.error("No file_path returned in Telegram getFile result.")
                 return None
 
-            # 2. Download file bytes
+            # 2. Download file bytes using synchronous streaming in a separate thread
             download_url = f"https://api.telegram.org/file/bot{settings.TELEGRAM_BOT_TOKEN}/{file_path}"
-            dl_res = await client.get(download_url)
-            if dl_res.status_code != 200:
-                logger.error("Failed to download file from %s (%d)", download_url, dl_res.status_code)
-                return None
-
             extension = Path(file_path).suffix or ".ogg"
             temp_file = Path(tempfile.gettempdir()) / f"tg_audio_{file_id}{extension}"
-            await asyncio.to_thread(temp_file.write_bytes, dl_res.content)
-            logger.info("Downloaded Telegram audio file (%d bytes) to %s", len(dl_res.content), temp_file)
-            return temp_file
+            try:
+                async with client.stream("GET", download_url) as response:
+                    response.raise_for_status()
+                    with open(temp_file, "wb") as f:
+                        async for chunk in response.aiter_bytes(65536):
+                            f.write(chunk)
+                logger.info("Downloaded Telegram audio file (%d bytes) to %s", temp_file.stat().st_size, temp_file)
+                return temp_file
+            except Exception as dl_err:
+                logger.error("Failed to download file from %s: %s", download_url, dl_err)
+                return None
 
     except Exception as err:
         logger.exception("Error downloading Telegram file %s: %s", file_id, err)

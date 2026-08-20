@@ -149,7 +149,7 @@ class KnowledgeBaseQAAgent:
             context_str = "\n\n".join(context_blocks)
             user_prompt = (
                 f"User Question:\n{clean_query}\n\n"
-                f"Retrieved Vault Context:\n{context_str}\n"
+                f"Retrieved Vault Context:\n<context>\n{context_str}\n</context>\n"
             )
 
             raw_answer = await self.llm.generate_text(

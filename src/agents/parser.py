@@ -148,21 +148,27 @@ def enforce_task_syntax(content: str, timestamp_str: str, due_date: str | None =
     """Enforce strict Obsidian Tasks syntax: - [ ] {Task} ➕ {CreatedDate} 📅 {DueDate}."""
     date_part = timestamp_str.split(" ")[0] if " " in timestamp_str else timestamp_str[:10]
 
-    created_match = re.search(r"➕\s*(\d{4}-\d{2}-\d{2})", content)
-    due_match = re.search(r"📅\s*(\d{4}-\d{2}-\d{2})", content)
+    result_lines = []
+    for line in content.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+            
+        created_match = re.search(r"➕\s*(\d{4}-\d{2}-\d{2})", line)
+        due_match = re.search(r"📅\s*(\d{4}-\d{2}-\d{2})", line)
 
-    created_date = created_match.group(1) if created_match else date_part
-    final_due_date = due_match.group(1) if due_match else (due_date or date_part)
+        created_date = created_match.group(1) if created_match else date_part
+        final_due_date = due_match.group(1) if due_match else (due_date or date_part)
 
-    task_body = content.strip()
-    task_body = re.sub(r"^[-*+]\s*(\[\s*[xX]?\s*\])?\s*", "", task_body)
-    task_body = re.sub(r"➕\s*\d{4}-\d{2}-\d{2}", "", task_body)
-    task_body = re.sub(r"📅\s*\d{4}-\d{2}-\d{2}", "", task_body)
-    task_body = task_body.strip()
+        task_body = re.sub(r"^[-*+]\s*(\[\s*[xX]?\s*\])?\s*", "", line)
+        task_body = re.sub(r"➕\s*\d{4}-\d{2}-\d{2}", "", task_body)
+        task_body = re.sub(r"📅\s*\d{4}-\d{2}-\d{2}", "", task_body)
+        task_body = task_body.strip()
 
-    task_body = normalize_obsidian_markdown(task_body)
+        task_body = normalize_obsidian_markdown(task_body)
+        result_lines.append(f"- [ ] {task_body} ➕ {created_date} 📅 {final_due_date}")
 
-    return f"- [ ] {task_body} ➕ {created_date} 📅 {final_due_date}"
+    return "\n".join(result_lines)
 
 
 class EntryParserAgent:

@@ -55,6 +55,10 @@ class Settings(BaseSettings):
         default_factory=list,
         description="Whitelisted Telegram user IDs permitted to interact with the PKM agent.",
     )
+    MFA_SECRET: str | None = Field(
+        default=None,
+        description="Base32 secret key for TOTP (e.g. Microsoft Authenticator) database reset verification.",
+    )
 
     # Vector Storage & Embeddings
     QDRANT_COLLECTION_NAME: str = Field(

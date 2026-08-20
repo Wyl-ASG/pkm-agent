@@ -13,6 +13,8 @@ logger = logging.getLogger(__name__)
 
 def extract_wikilinks(text: str) -> list[str]:
     """Extract Obsidian WikiLink target note names from text, stripping aliases."""
+    if len(text) > 100000:
+        return []
     matches = re.findall(r"\[\[([^\]\|]+)(?:\|[^\]]+)?\]\]", text)
     return [m.strip() for m in matches if m.strip()]
 

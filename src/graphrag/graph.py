@@ -164,6 +164,9 @@ class VaultKnowledgeGraph:
 
         # Remove old edges from this node
         if title in self.graph:
+            for target in self.graph.successors(title):
+                if target in self.nodes and title in self.nodes[target].backlinks:
+                    self.nodes[target].backlinks.remove(title)
             self.graph.remove_node(title)
 
         self.nodes[title] = node
@@ -188,6 +191,9 @@ class VaultKnowledgeGraph:
         rel_path = str(file_path.relative_to(self.vault_path)) if file_path.is_absolute() else str(file_path)
         title = self.path_to_title.get(rel_path, file_path.stem)
         if title in self.graph:
+            for target in self.graph.successors(title):
+                if target in self.nodes and title in self.nodes[target].backlinks:
+                    self.nodes[target].backlinks.remove(title)
             self.graph.remove_node(title)
         if title in self.nodes:
             del self.nodes[title]

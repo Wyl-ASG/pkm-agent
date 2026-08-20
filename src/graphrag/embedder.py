@@ -51,6 +51,8 @@ class TextEmbedder:
         self.device_setting = device or getattr(settings, "EMBEDDING_DEVICE", "cpu")
         self.resolved_device = resolve_torch_device(self.device_setting)
         self._model = None
+        import threading
+        self._model_lock = threading.Lock()
 
     @property
     def is_loaded(self) -> bool:
@@ -61,7 +63,9 @@ class TextEmbedder:
     def model(self):
         """Lazy load SentenceTransformer model instance on configured device."""
         if self._model is None:
-            from sentence_transformers import SentenceTransformer
+            with self._model_lock:
+                if self._model is None:
+                    from sentence_transformers import SentenceTransformer
 
             logger.info("Loading SentenceTransformer model '%s' on device '%s'", self.model_name, self.resolved_device)
             try:

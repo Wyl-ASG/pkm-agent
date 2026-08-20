@@ -48,7 +48,7 @@ class ResourceMonitor:
             try:
                 proc = psutil.Process(os.getpid())
                 process_rss_mb = proc.memory_info().rss / (1024 * 1024)
-                cpu_percent = psutil.cpu_percent(interval=None)
+                cpu_percent = psutil.cpu_percent(interval=0.1)
 
                 vm = psutil.virtual_memory()
                 total_ram_mb = vm.total / (1024 * 1024)

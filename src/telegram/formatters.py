@@ -105,8 +105,8 @@ def format_pending_tasks_message(
     # Build action buttons (capped at 15 to stay within Telegram UI limits)
     buttons: list[list[dict[str, str]]] = []
     for idx, t in enumerate(ordered_tasks_for_buttons[:15], 1):
-        target_hint = t.daily_date or t.source_note_display
-        cb_data = f"done:{target_hint}:{t.task_id}"
+        # Stay under Telegram's 64-byte limit
+        cb_data = f"done:{t.task_id}"
         btn_label = f"✅ {idx}. {t.clean_text_for_button}"
         buttons.append([{"text": btn_label, "callback_data": cb_data}])
 
@@ -211,8 +211,8 @@ def format_daily_scheduled_message(
     # Build action buttons
     buttons: list[list[dict[str, str]]] = []
     for idx, t in enumerate(actionable_tasks[:15], 1):
-        target_hint = t.daily_date or t.source_note_display
-        cb_data = f"done:{target_hint}:{t.task_id}"
+        # Stay under Telegram's 64-byte limit
+        cb_data = f"done:{t.task_id}"
         btn_label = f"✅ {idx}. {t.clean_text_for_button}"
         buttons.append([{"text": btn_label, "callback_data": cb_data}])
 

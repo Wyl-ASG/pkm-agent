@@ -344,7 +344,7 @@ class ObsidianVaultWriter:
             if not base_dir.exists():
                 continue
             direct_path = base_dir / f"{clean_query}.md"
-            if direct_path.exists() and direct_path.is_file():
+            if direct_path.exists() and direct_path.is_file() and direct_path.resolve().is_relative_to(self.vault_path):
                 return direct_path
             sanitized_path = base_dir / f"{safe_query}.md"
             if sanitized_path.exists() and sanitized_path.is_file():

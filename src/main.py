@@ -170,10 +170,26 @@ async def lifespan(app: FastAPI):
     # 4. Start daily 8:30 AM morning briefing background scheduler
     scheduler_task = asyncio.create_task(daily_task_digest_scheduler())
 
+    # 5. Start Memory Watchdog to proactively free RAM
+    async def memory_watchdog() -> None:
+        while True:
+            try:
+                await asyncio.sleep(60)
+                if resource_monitor.is_under_pressure():
+                    logger.warning("System under memory pressure! Evicting idle models...")
+                    audio_transcriber.unload_model()
+                    embedder.unload_model()
+                    reranker.unload_model()
+            except asyncio.CancelledError:
+                break
+
+    watchdog_task = asyncio.create_task(memory_watchdog())
+
     yield
 
     logger.info("FastAPI application shutting down...")
     scheduler_task.cancel()
+    watchdog_task.cancel()
     try:
         await scheduler_task
     except asyncio.CancelledError:
@@ -262,7 +278,9 @@ async def daily_task_digest_scheduler() -> None:
                 wait_seconds,
             )
 
-            await asyncio.sleep(wait_seconds)
+            from datetime import datetime
+            while datetime.now() < target_dt:
+                await asyncio.sleep(60)
 
             if settings.SCHEDULED_BRIEFING_ENABLED:
                 logger.info("Triggering automated daily 8:30 AM task briefing...")
@@ -327,32 +345,7 @@ async def _async_background_post_ingestion(
     """Execute non-blocking background indexing and Git synchronization after entry is persisted to Markdown."""
     async with resource_manager.background_job_semaphore:
         try:
-            # 1. Vector Indexing
-            doc_vec = await embedder.encode_async(entry.content)
-            doc_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{entry.timestamp}_{entry.content}"))
-            doc_payload = {
-                "id": doc_id,
-                "vector": doc_vec,
-                "content": entry.content,
-                "metadata": {
-                    "timestamp": entry.timestamp,
-                    "category": entry.category,
-                    "extracted_tags": entry.extracted_tags,
-                    "extracted_wikilinks": entry.extracted_wikilinks,
-                    "daily_note": daily_note_name,
-                    "atomic_note": atomic_note_name,
-                    "memory_type": entry.memory_type,
-                    "source_type": "user_authored",
-                },
-            }
-            await vector_store.upsert_documents_async([doc_payload])
-
-            # 2. Incremental BM25 & Graph Update (offloaded from event loop)
-            await asyncio.to_thread(
-                bm25_index.upsert_file_chunks,
-                f"Daily Notes/{daily_note_name}",
-                [{"id": doc_id, "content": entry.content, "metadata": doc_payload["metadata"]}],
-            )
+            # Graph Update (offloaded from event loop)
             await asyncio.to_thread(
                 knowledge_graph.update_file_note,
                 vault_writer.daily_notes_dir / daily_note_name,
@@ -528,6 +521,91 @@ async def process_telegram_audio_ingestion(
                 pass
 
 
+import pyotp
+import dotenv
+
+# In-memory set to track if a chat is waiting for a TOTP code
+pending_resets: set[int] = set()
+
+async def initiate_telegram_mfa_setup(chat_id: int) -> None:
+    """Generate and send MFA secret for TOTP setup."""
+    from src.config import settings
+    import pyotp
+    import dotenv
+    import os
+    
+    secret = pyotp.random_base32()
+    
+    def _save_secret() -> None:
+        dotenv.set_key(".env", "MFA_SECRET", secret)
+        os.chmod(".env", 0o600)
+
+    await asyncio.to_thread(_save_secret)
+    settings.MFA_SECRET = secret
+    
+    setup_msg = (
+        "🔐 *MFA Setup Required*\n\n"
+        "I have generated a new secret for your Authenticator app (e.g., Microsoft Authenticator).\n"
+        f"**Secret Key:** `{secret}`\n\n"
+        "Please add this manually to your app. It will be required for sensitive actions like `/reset`."
+    )
+    await send_telegram_message(chat_id, setup_msg)
+
+
+async def initiate_telegram_reset_db(chat_id: int) -> None:
+    """Initiate a database reset using TOTP Authenticator."""
+    from src.config import settings
+    
+    if not settings.MFA_SECRET:
+        await initiate_telegram_mfa_setup(chat_id)
+        return
+
+    pending_resets.add(chat_id)
+    
+    warning_msg = (
+        "⚠️ *WARNING: DATABASE RESET* ⚠️\n\n"
+        "You are about to completely wipe all notes and data from the vault. "
+        "This action is **irreversible**.\n\n"
+        "To confirm, please open your **Microsoft/Google Authenticator** app and reply with the current 6-digit TOTP code."
+    )
+    await send_telegram_message(chat_id, warning_msg)
+
+async def process_telegram_reset_db(chat_id: int) -> None:
+    """Clear all markdown notes from the vault except essential templates/configs, triggering a database wipe."""
+    logger.info("Executing database reset via Telegram command for chat %d", chat_id)
+    await send_telegram_message(chat_id, "🧹 *Initiating complete database reset. Deleting all notes...*")
+    
+    async with resource_manager.background_job_semaphore:
+        try:
+            import shutil
+            import os
+            from src.config import settings
+            vault_path = settings.VAULT_PATH
+            
+            allowed_items = {".obsidian", "templates", "dashboard.md", ".gitignore", ".git"}
+            
+            def _wipe_vault() -> int:
+                count = 0
+                for item in vault_path.iterdir():
+                    if item.name.lower() not in allowed_items:
+                        if item.is_dir():
+                            count += sum(len(files) for _, _, files in os.walk(item))
+                            shutil.rmtree(item)
+                        else:
+                            item.unlink()
+                            count += 1
+                return count
+            
+            deleted_count = await asyncio.to_thread(_wipe_vault)
+            
+            # Commit and push, bypassing the self-recovery mechanism so the deletion is permanent
+            await git_engine.commit_and_push("Vault reset: wiped all notes", bypass_recovery=True)
+            await send_telegram_message(chat_id, f"✅ *Database successfully reset.* (Deleted {deleted_count} notes/files)")
+        except Exception as err:
+            logger.exception("Database reset failed: %s", err)
+            await send_telegram_message(chat_id, "⚠️ Failed to reset database. Check server logs.")
+
+
 # ==============================================================================
 # FastAPI REST Endpoints
 # ==============================================================================
@@ -582,8 +660,18 @@ async def health_check() -> dict[str, Any]:
     }
 
 
-@app.post("/ask", response_model=QueryResponse)
-@app.post("/query", response_model=QueryResponse)
+from fastapi import Depends, Header, HTTPException
+
+def verify_api_key(api_key: str | None = Header(default=None, alias="x-api-key")) -> None:
+    expected = settings.TELEGRAM_SECRET_TOKEN
+    if not expected:
+        raise HTTPException(status_code=500, detail="API Token not configured on server")
+    if not api_key or not secrets.compare_digest(api_key, expected):
+        logger.warning("Rejected unauthorized API request.")
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+@app.post("/ask", response_model=QueryResponse, dependencies=[Depends(verify_api_key)])
+@app.post("/query", response_model=QueryResponse, dependencies=[Depends(verify_api_key)])
 async def ask_knowledge_base(request: QueryRequest) -> QueryResponse:
     """Query knowledge base and synthesize an answer using modern hybrid search, reranking, and provenance."""
     return await qa_agent.query(
@@ -594,7 +682,7 @@ async def ask_knowledge_base(request: QueryRequest) -> QueryResponse:
     )
 
 
-@app.post("/vault/reindex")
+@app.post("/vault/reindex", dependencies=[Depends(verify_api_key)])
 async def trigger_vault_reindex(
     background_tasks: BackgroundTasks,
     force: bool = False,
@@ -619,7 +707,7 @@ async def trigger_vault_reindex(
     return {"status": "reindexing_started", "force": str(force)}
 
 
-@app.post("/vault/consolidate", response_model=ConsolidationProposal)
+@app.post("/vault/consolidate", response_model=ConsolidationProposal, dependencies=[Depends(verify_api_key)])
 async def trigger_vault_consolidation() -> ConsolidationProposal:
     """Run knowledge consolidation and evolution report on demand under background job semaphore."""
     async with resource_manager.background_job_semaphore:
@@ -872,8 +960,29 @@ async def telegram_webhook(
 
     raw_text = update.message.text.strip()
 
+    # MFA Check for pending reset
+    if chat_id in pending_resets:
+        pending_resets.remove(chat_id)
+        if settings.MFA_SECRET:
+            totp = pyotp.TOTP(settings.MFA_SECRET)
+            if totp.verify(raw_text):
+                background_tasks.add_task(process_telegram_reset_db, chat_id)
+                return {"status": "reset_db_processing"}
+            else:
+                background_tasks.add_task(send_telegram_message, chat_id, "❌ Incorrect Authenticator code. Database reset cancelled.")
+                return {"status": "reset_db_cancelled"}
+
     # 6. Route commands vs queries vs text ingestion
-    if raw_text.startswith(("/consolidate", "/maintenance", "/review")):
+    if raw_text.startswith("/start"):
+        if not settings.MFA_SECRET:
+            background_tasks.add_task(initiate_telegram_mfa_setup, chat_id)
+        else:
+            background_tasks.add_task(send_telegram_message, chat_id, "🤖 Welcome back to PKM Agent! I am ready to process your notes and queries.")
+        return {"status": "start_processed"}
+    elif raw_text.startswith(("/reset_db", "/reset")):
+        background_tasks.add_task(initiate_telegram_reset_db, chat_id)
+        return {"status": "reset_db_mfa_sent"}
+    elif raw_text.startswith(("/consolidate", "/maintenance", "/review")):
         background_tasks.add_task(process_telegram_consolidation, chat_id)
         return {"status": "consolidation_processing"}
     elif is_task_query_intent(raw_text):
@@ -900,7 +1009,7 @@ class MarkTaskRequest(BaseModel):
     task_pattern: str | None = Field(default=None, description="Search substring matching task line")
 
 
-@app.get("/tasks/pending")
+@app.get("/tasks/pending", dependencies=[Depends(verify_api_key)])
 async def get_pending_tasks_endpoint() -> dict[str, Any]:
     """Return all active pending tasks from the vault in structured JSON and Markdown template format."""
     tasks = await vault_writer.get_all_tasks_async(include_completed=False)
@@ -924,7 +1033,7 @@ async def get_pending_tasks_endpoint() -> dict[str, Any]:
     }
 
 
-@app.post("/tasks/complete")
+@app.post("/tasks/complete", dependencies=[Depends(verify_api_key)])
 async def mark_task_complete_endpoint(req: MarkTaskRequest) -> dict[str, Any]:
     """Mark a task complete in the vault via API."""
     marked, note_name, task_text = await vault_writer.mark_task_by_id_or_pattern_async(
@@ -941,7 +1050,7 @@ async def mark_task_complete_endpoint(req: MarkTaskRequest) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="Task not found or already completed.")
 
 
-@app.post("/tasks/send-briefing")
+@app.post("/tasks/send-briefing", dependencies=[Depends(verify_api_key)])
 async def trigger_send_briefing_endpoint(
     background_tasks: BackgroundTasks,
     chat_id: int | None = None,

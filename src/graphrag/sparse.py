@@ -63,11 +63,7 @@ class BM25Index:
         self.doc_ids = [d["id"] for d in docs]
         self.documents = docs
         self.tokenized_corpus = [d["_tokens"] for d in docs]
-        if self.tokenized_corpus:
-            self._bm25 = BM25Plus(self.tokenized_corpus)
-            logger.info("Synchronized BM25 lexical index with %d documents.", len(self.documents))
-        else:
-            self._bm25 = None
+        self._bm25 = None  # Invalidate to rebuild lazily
 
     def build_index(self, documents: list[dict[str, Any]]) -> None:
         """Build or rebuild BM25 index from a list of document chunk payloads.
@@ -157,8 +153,12 @@ class BM25Index:
         Returns:
             List of result dictionaries with 'id', 'score', 'payload', 'content'.
         """
-        if not self._bm25 or not self.documents:
+        if not self.documents:
             return []
+        if not self._bm25:
+            # Defer expensive rebuild to search time
+            self._bm25 = BM25Plus(self.tokenized_corpus)
+            logger.info("Lazily rebuilt BM25 lexical index with %d documents.", len(self.documents))
 
         tokens = tokenize_for_bm25(query)
         if not tokens:

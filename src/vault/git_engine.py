@@ -4,6 +4,7 @@ import asyncio
 from contextlib import asynccontextmanager, contextmanager
 import logging
 from pathlib import Path
+import shlex
 import threading
 from typing import Any, Generator
 import git
@@ -19,9 +20,9 @@ def get_ssh_command(ssh_key_path: str | Path | None = None) -> str:
     if raw_path:
         key_path = Path(raw_path).resolve()
         if key_path.exists():
-            return f"ssh -i {key_path} -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o IdentitiesOnly=yes"
+            return f"ssh -i {shlex.quote(str(key_path))} -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15 -o ServerAliveInterval=15"
         logger.warning("Configured SSH key path does not exist: %s", key_path)
-    return "ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+    return "ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15"
 
 
 class GitConflictError(Exception):
@@ -205,6 +206,20 @@ class GitEngine:
             except Exception as err:
                 logger.exception("Unexpected error during git pull: %s", err)
                 return False
+    def _recover_mass_deletion(self) -> bool:
+        """Detect mass deletion and restore files from HEAD to trigger re-index."""
+        try:
+            # Use optimized raw git command to list only deleted files fast
+            diff_out = self.repo.git.diff("--name-only", "--diff-filter=D")
+            deleted_files = diff_out.splitlines() if diff_out else []
+            threshold = getattr(settings, 'MASS_DELETION_THRESHOLD', 50)
+            if len(deleted_files) > threshold:
+                logger.warning("Mass deletion detected (%d files). Assuming database reset. Restoring from git HEAD...", len(deleted_files))
+                self.repo.git.checkout("--", ".")
+                return True
+        except Exception as e:
+            logger.error("Error during mass deletion recovery: %s", e)
+        return False
 
     def commit_sync(self, message: str, file_paths: list[str | Path] | None = None) -> bool:
         """Stage and commit changes synchronously without creating empty commits.
@@ -219,6 +234,7 @@ class GitEngine:
         with self._thread_lock:
             try:
                 self.repo.git.update_environment(GIT_SSH_COMMAND=self.ssh_command)
+                self._recover_mass_deletion()
 
                 if file_paths:
                     rel_paths: list[str] = []
@@ -263,6 +279,20 @@ class GitEngine:
                     res = self.repo.git.push("origin", self.branch)
                     logger.info("Git push output: %s", res)
                     return True
+                except GitCommandError as e:
+                    if 'fetch first' in str(e) or 'non-fast-forward' in str(e):
+                        logger.warning("Git push rejected (fetch first). Pulling and retrying...")
+                        try:
+                            self.repo.git.pull("--rebase", "--autostash", "origin", self.branch)
+                            res = self.repo.git.push("origin", self.branch)
+                            logger.info("Git push output after pull: %s", res)
+                            return True
+                        except Exception as inner_e:
+                            logger.error("Git pull and push failed: %s", inner_e, exc_info=True)
+                            return False
+                    else:
+                        logger.error("Git push failed: %s", e, exc_info=True)
+                        return False
                 except Exception as e:
                     logger.error("Git push failed: %s", e, exc_info=True)
                     return False
@@ -271,11 +301,13 @@ class GitEngine:
                 logger.error("Git push failed: %s", err, exc_info=True)
                 return False
 
-    def commit_and_push_sync(self, commit_message: str) -> bool:
+    def commit_and_push_sync(self, commit_message: str, bypass_recovery: bool = False) -> bool:
         """Stage all changes, commit if dirty, and push to origin branch synchronously."""
         with self._thread_lock:
             try:
                 self.repo.git.update_environment(GIT_SSH_COMMAND=self.ssh_command)
+                if not bypass_recovery:
+                    self._recover_mass_deletion()
                 self.repo.git.add(A=True)
 
                 if self.repo.is_dirty(untracked_files=True):
@@ -292,6 +324,20 @@ class GitEngine:
                     res = self.repo.git.push("origin", self.branch)
                     logger.info("Git push output: %s", res)
                     return True
+                except GitCommandError as e:
+                    if 'fetch first' in str(e) or 'non-fast-forward' in str(e):
+                        logger.warning("Git push rejected (fetch first). Pulling and retrying...")
+                        try:
+                            self.repo.git.pull("--rebase", "--autostash", "origin", self.branch)
+                            res = self.repo.git.push("origin", self.branch)
+                            logger.info("Git push output after pull: %s", res)
+                            return True
+                        except Exception as inner_e:
+                            logger.error("Git pull and push failed: %s", inner_e, exc_info=True)
+                            return False
+                    else:
+                        logger.error("Git push failed: %s", e, exc_info=True)
+                        return False
                 except Exception as e:
                     logger.error("Git push failed: %s", e, exc_info=True)
                     return False
@@ -338,10 +384,10 @@ class GitEngine:
         async with self._get_async_lock():
             return await asyncio.to_thread(self.push_sync)
 
-    async def commit_and_push(self, commit_message: str) -> bool:
+    async def commit_and_push(self, commit_message: str, bypass_recovery: bool = False) -> bool:
         """Asynchronously stage all changes, commit if dirty, and push to origin."""
         async with self._get_async_lock():
-            return await asyncio.to_thread(self.commit_and_push_sync, commit_message)
+            return await asyncio.to_thread(self.commit_and_push_sync, commit_message, bypass_recovery)
 
     async def sync(self, commit_message: str) -> bool:
         """Execute full pull (rebase) -> commit -> push sync sequence asynchronously."""

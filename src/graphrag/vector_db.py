@@ -159,8 +159,8 @@ class QdrantVectorStore:
                         ),
                     )
 
-                # Create full-text payload index on 'content' field if running against remote server
-                if not self._storage_path and not self._in_memory and self._host != ":memory:":
+                # Create index for MatchText even on local disk
+                if not self._in_memory and self._host != ":memory:":
                     try:
                         self.client.create_payload_index(
                             collection_name=self.collection_name,

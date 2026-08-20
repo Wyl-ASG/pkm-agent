@@ -56,7 +56,7 @@ class KnowledgeConsolidator:
 
         candidate_pairs: set[tuple[str, str]] = set()
         for titles_with_token in token_to_titles.values():
-            if len(titles_with_token) > 1:
+            if 1 < len(titles_with_token) <= 50:
                 for i in range(len(titles_with_token)):
                     for j in range(i + 1, len(titles_with_token)):
                         t1, t2 = titles_with_token[i], titles_with_token[j]
@@ -94,7 +94,7 @@ class KnowledgeConsolidator:
         cutoff_ts = now_ts - (recent_days * 86400)
 
         for title, node in self.knowledge_graph.nodes.items():
-            file_path = self.vault_path / node.rel_path
+            file_path = self.vault_path / str(node.rel_path).lstrip('/')
             if file_path.exists():
                 try:
                     mtime = file_path.stat().st_mtime
