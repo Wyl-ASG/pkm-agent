@@ -277,8 +277,6 @@ async def daily_task_digest_scheduler() -> None:
                 target_dt.strftime("%Y-%m-%d %H:%M:%S"),
                 wait_seconds,
             )
-
-            from datetime import datetime
             while datetime.now() < target_dt:
                 await asyncio.sleep(60)
 
