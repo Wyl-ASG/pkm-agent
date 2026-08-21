@@ -150,7 +150,7 @@ class AntigravityLLM(LLMProvider):
         """
         combined_prompt = prompt
         if system_prompt:
-            combined_prompt = f"System Instructions:\n{system_prompt}\n\nTask:\n{prompt}"
+            combined_prompt = f"System Instructions:\n{system_prompt}\n\nUser Input Data:\n{prompt}"
 
         cmd = [
             self.binary_path,
@@ -234,7 +234,7 @@ class AntigravityLLM(LLMProvider):
 
         combined_prompt = prompt
         if system_prompt:
-            combined_prompt = f"System Instructions:\n{system_prompt}\n\nTask:\n{prompt}"
+            combined_prompt = f"System Instructions:\n{system_prompt}\n\nUser Input Data:\n{prompt}"
 
         cmd = [
             self.binary_path,

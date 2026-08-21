@@ -287,6 +287,23 @@ class Settings(BaseSettings):
             return [int(x) for x in v]
         return []
 
+    @field_validator("LLM_EFFORT", mode="before")
+    @classmethod
+    def validate_llm_effort(cls, v: object) -> str | None:
+        """Validate LLM reasoning effort level ('low', 'medium', 'high')."""
+        if v is None:
+            return None
+        if isinstance(v, str):
+            v_clean = v.strip().lower()
+            if not v_clean:
+                return None
+            if v_clean in ("low", "medium", "high"):
+                return v_clean
+            raise ValueError(
+                f"Invalid LLM_EFFORT '{v}'. Must be one of: 'low', 'medium', 'high', or unset."
+            )
+        return None
+
     model_config = SettingsConfigDict(
         env_file=(".env.local", ".env"),
         env_file_encoding="utf-8",

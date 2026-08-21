@@ -1,6 +1,6 @@
 """Entry parser agent for turning raw text inputs into structured InterstitialEntry models with grounded WikiLinks."""
 
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 import re
 from src.agents.models import InterstitialEntry
@@ -16,54 +16,75 @@ Your task is to parse raw user text into a structured InterstitialEntry object a
 
 CRITICAL INSTRUCTIONS FOR CONTENT FORMATTING & OBSIDIAN SYNTAX:
 
-1. WIKILINKS & ALIASES:
+1. NATURAL LANGUAGE TASK DETECTION & FORMATTING:
+   - Treat ANY natural language statement expressing a commitment, obligation, requirement, to-do item, deadline, or task (e.g. 'I am required to...', 'I need to...', 'I have to...', 'Remember to...', 'Must finish...', 'by Sunday', 'by tomorrow') as category='task'.
+   - DO NOT output assistant fallback phrases like 'Awaiting user instructions', 'Session initiated', or 'Ready to assist'.
+   - If category = 'task', format 'content' strictly as: - [ ] {Task Name with [[WikiLinks]]} ➕ YYYY-MM-DD 📅 YYYY-MM-DD
+     where '- [ ] ' is the Markdown task checkbox, '➕ YYYY-MM-DD' is the Created Date and '📅 YYYY-MM-DD' is the Due Date.
+
+2. WIKILINKS & ALIASES:
    - Identify all technical terms, services, platforms, software tools, frameworks, and key concepts, and wrap them in Obsidian DOUBLE-BRACKET WikiLinks (e.g. [[FastAPI]], [[Qdrant]], [[Docker]]).
    - If a list of 'Existing Obsidian Vault Notes' is provided, PRIORITIZE linking to those exact note titles (using aliases if phrasing differs, e.g. [[AWS Architecture|AWS setup]]). Do not invent redundant new titles when an existing note already matches the concept.
    - Use aliased links [[Actual Note Name|Display Title]] when transforming jargon, synonyms, or abbreviations (e.g. [[Amazon Web Services|AWS]], [[Application Load Balancer|ALB]], [[Amazon Elastic Container Service|ECS]]).
-   - NEVER use single brackets for WikiLinks or aliases (e.g. NEVER output [AWS] or [Web Application|web application]; ALWAYS output [[Amazon Web Services|AWS]] or [[Web Application|web application]]).
-   - Strictly format WikiLinks without broken or nested brackets (NEVER output [[[Concept]]]).
-   - In 'extracted_wikilinks', extract the target note name without the alias (e.g. 'Amazon Web Services' from '[[Amazon Web Services|AWS]]').
+   - NEVER use single brackets for WikiLinks or aliases.
+   - In 'extracted_wikilinks', extract the target note name without the alias.
 
-2. DATAVIEW INLINE KEYS:
+3. DATAVIEW INLINE KEYS:
    - Support inline properties formatted strictly as [key:: value] with brackets (e.g. [category:: work], [platform:: AWS], [status:: blocked]).
-   - Do NOT omit brackets around inline Dataview fields in text.
    - Extract key-value pairs into the 'dataview_fields' map.
 
-3. BLOCK IDENTIFIERS:
+4. BLOCK IDENTIFIERS:
    - If appropriate for referencing or transclusion, append a block anchor ^block-id at the end of the entry (e.g. ^log-20260815-0208, ^task-01).
-   - Set 'block_id' to the identifier string without the leading carat (e.g. 'log-20260815-0208').
 
-4. CALLOUTS:
-   - Wrap urgent alerts, critical warnings, key tips, or AI summaries in valid Obsidian callout syntax:
-     > [!WARNING] Optional Title
-     > Content of the warning...
-     or
-     > [!NOTE] Optional Title
-     > Summary or key insight...
-   - Valid callout types: NOTE, WARNING, TIP, IMPORTANT, CAUTION, INFO.
-   - MUST include square brackets around ![TYPE], e.g. '> [!WARNING]', NEVER '> !WARNING'.
-   - Set 'callout_type' to the uppercase callout keyword if applicable.
-
-5. OBSIDIAN TASKS FORMATTING:
-   - If the entry is a task or action item (category = 'task'):
-     Format 'content' strictly as: - [ ] {Task Name with [[WikiLinks]]} ➕ YYYY-MM-DD 📅 YYYY-MM-DD
-     where '- [ ] ' is the Markdown task checkbox, '➕ YYYY-MM-DD' is the Created Date and '📅 YYYY-MM-DD' is the Due Date.
-     NEVER omit the checkbox '- [ ]'.
-   - Set 'due_date' to the due date 'YYYY-MM-DD'.
+5. CALLOUTS:
+   - Wrap urgent alerts, critical warnings, key tips, or AI summaries in valid Obsidian callout syntax (> [!NOTE], > [!WARNING]).
 
 6. TAGS & CATEGORIZATION & MEMORY TYPE:
-   - Extract all topic hashtags (e.g. '#aws', '#infrastructure', '#cloud', '#networking') into 'extracted_tags'.
+   - Extract all topic hashtags (e.g. '#aws', '#infrastructure') into 'extracted_tags'.
    - Select an appropriate category (e.g. 'work', 'thought', 'task', 'journal', 'discovery', 'inbox').
    - Classify 'memory_type' into: 'fact', 'observation', 'decision', 'task', or 'ai_inference'.
 
 7. ATOMIC NOTES & ZETTELKASTEN:
-   - If input contains an architectural insight, standalone concept, or major decision requiring an independent note:
-     Set 'requires_atomic_note' = True, provide 'atomic_note_title', 'atomic_note_confidence' (0.0 to 1.0), 'atomic_note_reason', and write clean Markdown body content for 'atomic_note_content'.
-   - Otherwise, set 'requires_atomic_note' = False, 'atomic_note_title' = None, and 'atomic_note_content' = None.
+   - If input contains an architectural insight, standalone concept, or major decision requiring an independent note, set 'requires_atomic_note' = True.
 
 8. TIMESTAMP:
    - Set 'timestamp' to the provided input timestamp or current time in 'YYYY-MM-DD HH:MM' format.
 """
+
+
+def extract_due_date_from_natural_language(text: str, ref_date: datetime | None = None) -> str | None:
+    """Extract YYYY-MM-DD due date from natural language time expressions like 'by Sunday', 'by tomorrow'."""
+    now = ref_date or datetime.now()
+    t = text.lower()
+    days_map = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3, "friday": 4, "saturday": 5, "sunday": 6}
+
+    if "tomorrow" in t:
+        return (now + timedelta(days=1)).strftime("%Y-%m-%d")
+    if "today" in t:
+        return now.strftime("%Y-%m-%d")
+
+    for day_name, day_num in days_map.items():
+        pattern = rf"\b(?:by|on|this|due)\s+{day_name}\b"
+        if re.search(pattern, t):
+            current_day = now.weekday()
+            days_ahead = (day_num - current_day) % 7
+            if days_ahead == 0:
+                days_ahead = 7
+            return (now + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+
+    return None
+
+
+def is_natural_language_task(text: str) -> bool:
+    """Check if raw text string contains task/to-do indicators or deadline expressions."""
+    t = text.lower()
+    indicators = [
+        "required to", "need to", "needs to", "have to", "has to", "must ",
+        "remember to", "todo", "to-do", "should ", "due ", "finish ",
+        "by sunday", "by monday", "by tuesday", "by wednesday", "by thursday",
+        "by friday", "by saturday", "by tomorrow", "by today"
+    ]
+    return any(ind in t for ind in indicators)
 
 
 def normalize_obsidian_markdown(text: str) -> str:
@@ -96,7 +117,6 @@ def normalize_obsidian_markdown(text: str) -> str:
     )
 
     # 4. Fix single bracketed entities that should be WikiLinks:
-    # Converts [Target] to [[Target]], while preserving markdown links [Title](url), tasks [ ], [x], callouts [!NOTE], dataview [k::v]
     def fix_single_bracket_link(match: re.Match) -> str:
         content = match.group(1).strip()
         if content in ("", " ", "x", "X", "/", "-") or content.startswith("!"):
@@ -105,7 +125,6 @@ def normalize_obsidian_markdown(text: str) -> str:
             return match.group(0)
         if content.startswith("^"):
             return match.group(0)
-        # Preserve numeric citations like [1], [2] unless it's a date like 2026-08-15
         if content.isdigit():
             return match.group(0)
         return f"[[{content}]]"
@@ -153,7 +172,7 @@ def enforce_task_syntax(content: str, timestamp_str: str, due_date: str | None =
         line = line.strip()
         if not line:
             continue
-            
+
         created_match = re.search(r"➕\s*(\d{4}-\d{2}-\d{2})", line)
         due_match = re.search(r"📅\s*(\d{4}-\d{2}-\d{2})", line)
 
@@ -226,6 +245,50 @@ class EntryParserAgent:
             if not entry.timestamp:
                 entry.timestamp = entry_timestamp
 
+            # Check if LLM output contains conversational meta-chatter fallback phrases
+            meta_chatter_patterns = [
+                r"\bawaiting user\b",
+                r"\bno task was specified\b",
+                r"\bready to assist\b",
+                r"\bsession initiated\b",
+                r"\bno specific task\b",
+                r"\bawaiting task\b",
+                r"\bawaiting instructions\b",
+                r"\bcompleted response\b",
+                r"\buser request\b",
+            ]
+            content_lower = (entry.content or "").lower()
+            if any(re.search(pat, content_lower) for pat in meta_chatter_patterns) or not entry.content:
+                logger.warning("LLM returned conversational meta-chatter fallback. Restoring raw text content.")
+                entry.content = raw_text.strip()
+
+            # Natural language task detection & relative date extraction
+            is_nl_task = is_natural_language_task(raw_text)
+            is_task_category = entry.category.lower().strip() in (
+                "task", "tasks", "priority", "priorities", "todo"
+            )
+
+            if is_nl_task or is_task_category:
+                entry.category = "task"
+                entry.memory_type = "task"
+
+                # Ensure task content retains the user's actual raw text if LLM modified it into generic text
+                if is_nl_task:
+                    entry.content = raw_text.strip()
+
+                nl_due = extract_due_date_from_natural_language(raw_text)
+                if nl_due:
+                    entry.due_date = nl_due
+
+                entry.content = enforce_task_syntax(
+                    content=entry.content,
+                    timestamp_str=entry.timestamp,
+                    due_date=entry.due_date,
+                )
+                due_match = re.search(r"📅\s*(\d{4}-\d{2}-\d{2})", entry.content)
+                if due_match:
+                    entry.due_date = due_match.group(1)
+
             # Normalize markdown syntax
             entry.content = normalize_obsidian_markdown(entry.content)
 
@@ -253,20 +316,6 @@ class EntryParserAgent:
                 found_block = extract_block_id_from_text(entry.content)
                 if found_block:
                     entry.block_id = found_block
-
-            # Defensive enforcement of Obsidian Tasks syntax if category is task
-            is_task = entry.category.lower().strip() in (
-                "task", "tasks", "priority", "priorities", "todo"
-            )
-            if is_task:
-                entry.content = enforce_task_syntax(
-                    content=entry.content,
-                    timestamp_str=entry.timestamp,
-                    due_date=entry.due_date,
-                )
-                due_match = re.search(r"📅\s*(\d{4}-\d{2}-\d{2})", entry.content)
-                if due_match:
-                    entry.due_date = due_match.group(1)
 
             return entry
 

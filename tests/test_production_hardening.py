@@ -375,3 +375,41 @@ async def test_consolidation_respects_background_job_semaphore(monkeypatch):
             await process_telegram_consolidation(chat_id=12345)
 
     assert semaphore_acquired is True
+
+
+def test_llm_effort_validation():
+    """Verify Settings validates LLM_EFFORT values ('low', 'medium', 'high', or None)."""
+    from src.config import Settings
+
+    s1 = Settings(LLM_EFFORT="high")
+    assert s1.LLM_EFFORT == "high"
+
+    s2 = Settings(LLM_EFFORT="  MEDIUM  ")
+    assert s2.LLM_EFFORT == "medium"
+
+    s3 = Settings(LLM_EFFORT=None)
+    assert s3.LLM_EFFORT is None
+
+    s4 = Settings(LLM_EFFORT="")
+    assert s4.LLM_EFFORT is None
+
+    with pytest.raises(ValueError, match="Invalid LLM_EFFORT 'high3'"):
+        Settings(LLM_EFFORT="high3")
+
+
+@pytest.mark.asyncio
+async def test_antigravity_llm_stderr_stripping():
+    """Verify AntigravityLLM strips whitespace from stderr when command fails."""
+    llm = AntigravityLLM(timeout=5)
+
+    with patch("asyncio.create_subprocess_exec") as mock_subproc:
+        mock_proc = MagicMock()
+        mock_proc.returncode = 1
+        mock_proc.communicate = AsyncMock(return_value=(b"", b"\n\nError: invalid --effort high3\n\n"))
+        mock_subproc.return_value = mock_proc
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await llm.generate_text("Test prompt")
+
+        assert "agy CLI execution failed (exit code 1): Error: invalid --effort high3" in str(exc_info.value)
+

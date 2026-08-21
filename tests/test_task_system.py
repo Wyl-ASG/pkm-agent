@@ -69,3 +69,17 @@ def test_parse_task_line_edge_cases():
     task_completed = parse_task_line(line_completed, "Daily Notes/2026-08-16.md", "2026-08-16.md", 7)
     assert task_completed is not None
     assert task_completed.completed is True
+
+
+def test_natural_language_task_parsing():
+    """Test natural language task detection and relative date calculation."""
+    from datetime import datetime
+    from src.agents.parser import is_natural_language_task, extract_due_date_from_natural_language
+
+    raw_input = "I am required to complete my fyp infra by sunday"
+    assert is_natural_language_task(raw_input) is True
+
+    ref_date = datetime(2026, 8, 21)  # Friday
+    due = extract_due_date_from_natural_language(raw_input, ref_date=ref_date)
+    assert due == "2026-08-23"  # Sunday
+

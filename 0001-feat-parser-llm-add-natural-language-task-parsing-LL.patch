@@ -1,0 +1,370 @@
+From f88c854a96f36b22109897bb3aa4b49d45cad98f Mon Sep 17 00:00:00 2001
+From: Ubuntu <ubuntu@localhost.localdomain>
+Date: Fri, 21 Aug 2026 09:29:04 +0800
+Subject: [PATCH] feat(parser, llm): add natural language task parsing, LLM
+ effort validation, and agy CLI error handling
+
+---
+ src/agents/parser.py               | 145 +++++++++++++++++++----------
+ src/config.py                      |  17 ++++
+ src/llm/antigravity_llm.py         |   8 +-
+ tests/test_production_hardening.py |  38 ++++++++
+ tests/test_task_system.py          |  14 +++
+ 5 files changed, 170 insertions(+), 52 deletions(-)
+
+diff --git a/src/agents/parser.py b/src/agents/parser.py
+index 872d536..e252673 100644
+--- a/src/agents/parser.py
++++ b/src/agents/parser.py
+@@ -1,6 +1,6 @@
+ """Entry parser agent for turning raw text inputs into structured InterstitialEntry models with grounded WikiLinks."""
+ 
+-from datetime import datetime
++from datetime import datetime, timedelta
+ import logging
+ import re
+ from src.agents.models import InterstitialEntry
+@@ -16,56 +16,77 @@ Your task is to parse raw user text into a structured InterstitialEntry object a
+ 
+ CRITICAL INSTRUCTIONS FOR CONTENT FORMATTING & OBSIDIAN SYNTAX:
+ 
+-1. WIKILINKS & ALIASES:
++1. NATURAL LANGUAGE TASK DETECTION & FORMATTING:
++   - Treat ANY natural language statement expressing a commitment, obligation, requirement, to-do item, deadline, or task (e.g. 'I am required to...', 'I need to...', 'I have to...', 'Remember to...', 'Must finish...', 'by Sunday', 'by tomorrow') as category='task'.
++   - DO NOT output assistant fallback phrases like 'Awaiting user instructions', 'Session initiated', or 'Ready to assist'.
++   - If category = 'task', format 'content' strictly as: - [ ] {Task Name with [[WikiLinks]]} ➕ YYYY-MM-DD 📅 YYYY-MM-DD
++     where '- [ ] ' is the Markdown task checkbox, '➕ YYYY-MM-DD' is the Created Date and '📅 YYYY-MM-DD' is the Due Date.
++
++2. WIKILINKS & ALIASES:
+    - Identify all technical terms, services, platforms, software tools, frameworks, and key concepts, and wrap them in Obsidian DOUBLE-BRACKET WikiLinks (e.g. [[FastAPI]], [[Qdrant]], [[Docker]]).
+    - If a list of 'Existing Obsidian Vault Notes' is provided, PRIORITIZE linking to those exact note titles (using aliases if phrasing differs, e.g. [[AWS Architecture|AWS setup]]). Do not invent redundant new titles when an existing note already matches the concept.
+    - Use aliased links [[Actual Note Name|Display Title]] when transforming jargon, synonyms, or abbreviations (e.g. [[Amazon Web Services|AWS]], [[Application Load Balancer|ALB]], [[Amazon Elastic Container Service|ECS]]).
+-   - NEVER use single brackets for WikiLinks or aliases (e.g. NEVER output [AWS] or [Web Application|web application]; ALWAYS output [[Amazon Web Services|AWS]] or [[Web Application|web application]]).
+-   - Strictly format WikiLinks without broken or nested brackets (NEVER output [[[Concept]]]).
+-   - In 'extracted_wikilinks', extract the target note name without the alias (e.g. 'Amazon Web Services' from '[[Amazon Web Services|AWS]]').
++   - NEVER use single brackets for WikiLinks or aliases.
++   - In 'extracted_wikilinks', extract the target note name without the alias.
+ 
+-2. DATAVIEW INLINE KEYS:
++3. DATAVIEW INLINE KEYS:
+    - Support inline properties formatted strictly as [key:: value] with brackets (e.g. [category:: work], [platform:: AWS], [status:: blocked]).
+-   - Do NOT omit brackets around inline Dataview fields in text.
+    - Extract key-value pairs into the 'dataview_fields' map.
+ 
+-3. BLOCK IDENTIFIERS:
++4. BLOCK IDENTIFIERS:
+    - If appropriate for referencing or transclusion, append a block anchor ^block-id at the end of the entry (e.g. ^log-20260815-0208, ^task-01).
+-   - Set 'block_id' to the identifier string without the leading carat (e.g. 'log-20260815-0208').
+-
+-4. CALLOUTS:
+-   - Wrap urgent alerts, critical warnings, key tips, or AI summaries in valid Obsidian callout syntax:
+-     > [!WARNING] Optional Title
+-     > Content of the warning...
+-     or
+-     > [!NOTE] Optional Title
+-     > Summary or key insight...
+-   - Valid callout types: NOTE, WARNING, TIP, IMPORTANT, CAUTION, INFO.
+-   - MUST include square brackets around ![TYPE], e.g. '> [!WARNING]', NEVER '> !WARNING'.
+-   - Set 'callout_type' to the uppercase callout keyword if applicable.
+-
+-5. OBSIDIAN TASKS FORMATTING:
+-   - If the entry is a task or action item (category = 'task'):
+-     Format 'content' strictly as: - [ ] {Task Name with [[WikiLinks]]} ➕ YYYY-MM-DD 📅 YYYY-MM-DD
+-     where '- [ ] ' is the Markdown task checkbox, '➕ YYYY-MM-DD' is the Created Date and '📅 YYYY-MM-DD' is the Due Date.
+-     NEVER omit the checkbox '- [ ]'.
+-   - Set 'due_date' to the due date 'YYYY-MM-DD'.
++
++5. CALLOUTS:
++   - Wrap urgent alerts, critical warnings, key tips, or AI summaries in valid Obsidian callout syntax (> [!NOTE], > [!WARNING]).
+ 
+ 6. TAGS & CATEGORIZATION & MEMORY TYPE:
+-   - Extract all topic hashtags (e.g. '#aws', '#infrastructure', '#cloud', '#networking') into 'extracted_tags'.
++   - Extract all topic hashtags (e.g. '#aws', '#infrastructure') into 'extracted_tags'.
+    - Select an appropriate category (e.g. 'work', 'thought', 'task', 'journal', 'discovery', 'inbox').
+    - Classify 'memory_type' into: 'fact', 'observation', 'decision', 'task', or 'ai_inference'.
+ 
+ 7. ATOMIC NOTES & ZETTELKASTEN:
+-   - If input contains an architectural insight, standalone concept, or major decision requiring an independent note:
+-     Set 'requires_atomic_note' = True, provide 'atomic_note_title', 'atomic_note_confidence' (0.0 to 1.0), 'atomic_note_reason', and write clean Markdown body content for 'atomic_note_content'.
+-   - Otherwise, set 'requires_atomic_note' = False, 'atomic_note_title' = None, and 'atomic_note_content' = None.
++   - If input contains an architectural insight, standalone concept, or major decision requiring an independent note, set 'requires_atomic_note' = True.
+ 
+ 8. TIMESTAMP:
+    - Set 'timestamp' to the provided input timestamp or current time in 'YYYY-MM-DD HH:MM' format.
+ """
+ 
+ 
++def extract_due_date_from_natural_language(text: str, ref_date: datetime | None = None) -> str | None:
++    """Extract YYYY-MM-DD due date from natural language time expressions like 'by Sunday', 'by tomorrow'."""
++    now = ref_date or datetime.now()
++    t = text.lower()
++    days_map = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3, "friday": 4, "saturday": 5, "sunday": 6}
++
++    if "tomorrow" in t:
++        return (now + timedelta(days=1)).strftime("%Y-%m-%d")
++    if "today" in t:
++        return now.strftime("%Y-%m-%d")
++
++    for day_name, day_num in days_map.items():
++        pattern = rf"\b(?:by|on|this|due)\s+{day_name}\b"
++        if re.search(pattern, t):
++            current_day = now.weekday()
++            days_ahead = (day_num - current_day) % 7
++            if days_ahead == 0:
++                days_ahead = 7
++            return (now + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
++
++    return None
++
++
++def is_natural_language_task(text: str) -> bool:
++    """Check if raw text string contains task/to-do indicators or deadline expressions."""
++    t = text.lower()
++    indicators = [
++        "required to", "need to", "needs to", "have to", "has to", "must ",
++        "remember to", "todo", "to-do", "should ", "due ", "finish ",
++        "by sunday", "by monday", "by tuesday", "by wednesday", "by thursday",
++        "by friday", "by saturday", "by tomorrow", "by today"
++    ]
++    return any(ind in t for ind in indicators)
++
++
+ def normalize_obsidian_markdown(text: str) -> str:
+     """Normalize Obsidian markdown syntax in text for WikiLinks, Callouts, Dataview fields, and Tasks."""
+     if not text:
+@@ -96,7 +117,6 @@ def normalize_obsidian_markdown(text: str) -> str:
+     )
+ 
+     # 4. Fix single bracketed entities that should be WikiLinks:
+-    # Converts [Target] to [[Target]], while preserving markdown links [Title](url), tasks [ ], [x], callouts [!NOTE], dataview [k::v]
+     def fix_single_bracket_link(match: re.Match) -> str:
+         content = match.group(1).strip()
+         if content in ("", " ", "x", "X", "/", "-") or content.startswith("!"):
+@@ -105,7 +125,6 @@ def normalize_obsidian_markdown(text: str) -> str:
+             return match.group(0)
+         if content.startswith("^"):
+             return match.group(0)
+-        # Preserve numeric citations like [1], [2] unless it's a date like 2026-08-15
+         if content.isdigit():
+             return match.group(0)
+         return f"[[{content}]]"
+@@ -153,7 +172,7 @@ def enforce_task_syntax(content: str, timestamp_str: str, due_date: str | None =
+         line = line.strip()
+         if not line:
+             continue
+-            
++
+         created_match = re.search(r"➕\s*(\d{4}-\d{2}-\d{2})", line)
+         due_match = re.search(r"📅\s*(\d{4}-\d{2}-\d{2})", line)
+ 
+@@ -226,6 +245,50 @@ class EntryParserAgent:
+             if not entry.timestamp:
+                 entry.timestamp = entry_timestamp
+ 
++            # Check if LLM output contains conversational meta-chatter fallback phrases
++            meta_chatter_patterns = [
++                r"\bawaiting user\b",
++                r"\bno task was specified\b",
++                r"\bready to assist\b",
++                r"\bsession initiated\b",
++                r"\bno specific task\b",
++                r"\bawaiting task\b",
++                r"\bawaiting instructions\b",
++                r"\bcompleted response\b",
++                r"\buser request\b",
++            ]
++            content_lower = (entry.content or "").lower()
++            if any(re.search(pat, content_lower) for pat in meta_chatter_patterns) or not entry.content:
++                logger.warning("LLM returned conversational meta-chatter fallback. Restoring raw text content.")
++                entry.content = raw_text.strip()
++
++            # Natural language task detection & relative date extraction
++            is_nl_task = is_natural_language_task(raw_text)
++            is_task_category = entry.category.lower().strip() in (
++                "task", "tasks", "priority", "priorities", "todo"
++            )
++
++            if is_nl_task or is_task_category:
++                entry.category = "task"
++                entry.memory_type = "task"
++
++                # Ensure task content retains the user's actual raw text if LLM modified it into generic text
++                if is_nl_task:
++                    entry.content = raw_text.strip()
++
++                nl_due = extract_due_date_from_natural_language(raw_text)
++                if nl_due:
++                    entry.due_date = nl_due
++
++                entry.content = enforce_task_syntax(
++                    content=entry.content,
++                    timestamp_str=entry.timestamp,
++                    due_date=entry.due_date,
++                )
++                due_match = re.search(r"📅\s*(\d{4}-\d{2}-\d{2})", entry.content)
++                if due_match:
++                    entry.due_date = due_match.group(1)
++
+             # Normalize markdown syntax
+             entry.content = normalize_obsidian_markdown(entry.content)
+ 
+@@ -254,20 +317,6 @@ class EntryParserAgent:
+                 if found_block:
+                     entry.block_id = found_block
+ 
+-            # Defensive enforcement of Obsidian Tasks syntax if category is task
+-            is_task = entry.category.lower().strip() in (
+-                "task", "tasks", "priority", "priorities", "todo"
+-            )
+-            if is_task:
+-                entry.content = enforce_task_syntax(
+-                    content=entry.content,
+-                    timestamp_str=entry.timestamp,
+-                    due_date=entry.due_date,
+-                )
+-                due_match = re.search(r"📅\s*(\d{4}-\d{2}-\d{2})", entry.content)
+-                if due_match:
+-                    entry.due_date = due_match.group(1)
+-
+             return entry
+ 
+         except Exception as err:
+diff --git a/src/config.py b/src/config.py
+index 9db391a..5983186 100644
+--- a/src/config.py
++++ b/src/config.py
+@@ -287,6 +287,23 @@ class Settings(BaseSettings):
+             return [int(x) for x in v]
+         return []
+ 
++    @field_validator("LLM_EFFORT", mode="before")
++    @classmethod
++    def validate_llm_effort(cls, v: object) -> str | None:
++        """Validate LLM reasoning effort level ('low', 'medium', 'high')."""
++        if v is None:
++            return None
++        if isinstance(v, str):
++            v_clean = v.strip().lower()
++            if not v_clean:
++                return None
++            if v_clean in ("low", "medium", "high"):
++                return v_clean
++            raise ValueError(
++                f"Invalid LLM_EFFORT '{v}'. Must be one of: 'low', 'medium', 'high', or unset."
++            )
++        return None
++
+     model_config = SettingsConfigDict(
+         env_file=(".env.local", ".env"),
+         env_file_encoding="utf-8",
+diff --git a/src/llm/antigravity_llm.py b/src/llm/antigravity_llm.py
+index a4bb9af..254d20c 100644
+--- a/src/llm/antigravity_llm.py
++++ b/src/llm/antigravity_llm.py
+@@ -122,7 +122,7 @@ class AntigravityLLM(LLMProvider):
+         """
+         combined_prompt = prompt
+         if system_prompt:
+-            combined_prompt = f"System Instructions:\n{system_prompt}\n\nTask:\n{prompt}"
++            combined_prompt = f"System Instructions:\n{system_prompt}\n\nUser Input Data:\n{prompt}"
+ 
+         cmd = [
+             self.binary_path,
+@@ -152,7 +152,7 @@ class AntigravityLLM(LLMProvider):
+                 )
+ 
+                 if process.returncode != 0:
+-                    err_msg = stderr.decode("utf-8", errors="replace")[:1000]
++                    err_msg = stderr.decode("utf-8", errors="replace").strip()[:1000]
+                     logger.error("agy CLI command failed with exit code %d: %s", process.returncode, err_msg)
+                     raise RuntimeError(f"agy CLI execution failed (exit code {process.returncode}): {err_msg}")
+ 
+@@ -206,7 +206,7 @@ class AntigravityLLM(LLMProvider):
+ 
+         combined_prompt = prompt
+         if system_prompt:
+-            combined_prompt = f"System Instructions:\n{system_prompt}\n\nTask:\n{prompt}"
++            combined_prompt = f"System Instructions:\n{system_prompt}\n\nUser Input Data:\n{prompt}"
+ 
+         cmd = [
+             self.binary_path,
+@@ -238,7 +238,7 @@ class AntigravityLLM(LLMProvider):
+                 )
+ 
+                 if process.returncode != 0:
+-                    err_msg = stderr.decode("utf-8", errors="replace")[:1000]
++                    err_msg = stderr.decode("utf-8", errors="replace").strip()[:1000]
+                     logger.error("agy CLI command failed with exit code %d: %s", process.returncode, err_msg)
+                     raise RuntimeError(f"agy CLI execution failed (exit code {process.returncode}): {err_msg}")
+ 
+diff --git a/tests/test_production_hardening.py b/tests/test_production_hardening.py
+index 7bd8479..147a8e8 100644
+--- a/tests/test_production_hardening.py
++++ b/tests/test_production_hardening.py
+@@ -335,3 +335,41 @@ async def test_consolidation_respects_background_job_semaphore(monkeypatch):
+             await process_telegram_consolidation(chat_id=12345)
+ 
+     assert semaphore_acquired is True
++
++
++def test_llm_effort_validation():
++    """Verify Settings validates LLM_EFFORT values ('low', 'medium', 'high', or None)."""
++    from src.config import Settings
++
++    s1 = Settings(LLM_EFFORT="high")
++    assert s1.LLM_EFFORT == "high"
++
++    s2 = Settings(LLM_EFFORT="  MEDIUM  ")
++    assert s2.LLM_EFFORT == "medium"
++
++    s3 = Settings(LLM_EFFORT=None)
++    assert s3.LLM_EFFORT is None
++
++    s4 = Settings(LLM_EFFORT="")
++    assert s4.LLM_EFFORT is None
++
++    with pytest.raises(ValueError, match="Invalid LLM_EFFORT 'high3'"):
++        Settings(LLM_EFFORT="high3")
++
++
++@pytest.mark.asyncio
++async def test_antigravity_llm_stderr_stripping():
++    """Verify AntigravityLLM strips whitespace from stderr when command fails."""
++    llm = AntigravityLLM(timeout=5)
++
++    with patch("asyncio.create_subprocess_exec") as mock_subproc:
++        mock_proc = MagicMock()
++        mock_proc.returncode = 1
++        mock_proc.communicate = AsyncMock(return_value=(b"", b"\n\nError: invalid --effort high3\n\n"))
++        mock_subproc.return_value = mock_proc
++
++        with pytest.raises(RuntimeError) as exc_info:
++            await llm.generate_text("Test prompt")
++
++        assert "agy CLI execution failed (exit code 1): Error: invalid --effort high3" in str(exc_info.value)
++
+diff --git a/tests/test_task_system.py b/tests/test_task_system.py
+index e11baf4..c932fb1 100644
+--- a/tests/test_task_system.py
++++ b/tests/test_task_system.py
+@@ -69,3 +69,17 @@ def test_parse_task_line_edge_cases():
+     task_completed = parse_task_line(line_completed, "Daily Notes/2026-08-16.md", "2026-08-16.md", 7)
+     assert task_completed is not None
+     assert task_completed.completed is True
++
++
++def test_natural_language_task_parsing():
++    """Test natural language task detection and relative date calculation."""
++    from datetime import datetime
++    from src.agents.parser import is_natural_language_task, extract_due_date_from_natural_language
++
++    raw_input = "I am required to complete my fyp infra by sunday"
++    assert is_natural_language_task(raw_input) is True
++
++    ref_date = datetime(2026, 8, 21)  # Friday
++    due = extract_due_date_from_natural_language(raw_input, ref_date=ref_date)
++    assert due == "2026-08-23"  # Sunday
++
+-- 
+2.43.0
+
