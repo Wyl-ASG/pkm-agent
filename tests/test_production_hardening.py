@@ -98,6 +98,46 @@ async def test_antigravity_timeout_handling():
         mock_proc.kill.assert_called_once()
 
 
+@pytest.mark.asyncio
+async def test_antigravity_error_output_extraction():
+    """Verify AntigravityLLM correctly extracts error message from stdout JSON when stderr is empty."""
+    llm = AntigravityLLM()
+    mock_error_json = (
+        b'{"status":"ERROR","error":"invalid model selection (--model \\"invalid_model\\"): not recognized"}'
+    )
+
+    with patch("asyncio.create_subprocess_exec") as mock_subproc:
+        mock_proc = MagicMock()
+        mock_proc.returncode = 1
+        mock_proc.communicate = AsyncMock(return_value=(mock_error_json, b""))
+        mock_subproc.return_value = mock_proc
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await llm.generate_text("Test query")
+
+        assert "invalid model selection" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_antigravity_error_output_strips_newlines():
+    """Verify AntigravityLLM strips leading and trailing newlines from stderr output when a CLI process fails."""
+    llm = AntigravityLLM()
+    mock_stderr = b"\n\nError: model execution failed\n\n"
+
+    with patch("asyncio.create_subprocess_exec") as mock_subproc:
+        mock_proc = MagicMock()
+        mock_proc.returncode = 1
+        mock_proc.communicate = AsyncMock(return_value=(b"", mock_stderr))
+        mock_subproc.return_value = mock_proc
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await llm.generate_text("Test query")
+
+        err_str = str(exc_info.value)
+        assert err_str.startswith("agy CLI execution failed (exit code 1): Error: model execution failed")
+        assert not err_str.endswith("\n")
+
+
 def test_git_failure_preserves_local_markdown(tmp_path):
     """Verify that if a remote Git sync fails, the local Markdown note remains safely written and intact."""
     vault_dir = tmp_path / "vault"

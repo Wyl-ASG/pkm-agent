@@ -106,6 +106,34 @@ class AntigravityLLM(LLMProvider):
             pass
         return self._clean_markdown_code_block(output_text)
 
+    def _extract_error_message(self, stdout_bytes: bytes, stderr_bytes: bytes) -> str:
+        """Extract human-readable error details from stdout and stderr of agy process.
+
+        agy CLI outputs structured JSON errors (with an 'error' key) to stdout upon non-zero exit.
+        """
+        stderr_str = stderr_bytes.decode("utf-8", errors="replace").strip()
+        stdout_str = stdout_bytes.decode("utf-8", errors="replace").strip()
+
+        if stdout_str:
+            try:
+                data = json.loads(stdout_str)
+                if isinstance(data, dict) and data.get("error"):
+                    err = str(data["error"]).strip()
+                    if stderr_str:
+                        return f"{err} (stderr: {stderr_str[:500]})".strip()
+                    return err
+            except json.JSONDecodeError:
+                pass
+
+        if stderr_str and stdout_str:
+            return f"{stderr_str[:1000]} | stdout: {stdout_str[:1000]}".strip()
+        elif stderr_str:
+            return stderr_str[:1000].strip()
+        elif stdout_str:
+            return stdout_str[:1000].strip()
+
+        return "No error message provided on stdout or stderr"
+
     async def generate_text(
         self,
         prompt: str,
@@ -152,7 +180,7 @@ class AntigravityLLM(LLMProvider):
                 )
 
                 if process.returncode != 0:
-                    err_msg = stderr.decode("utf-8", errors="replace")[:1000]
+                    err_msg = self._extract_error_message(stdout, stderr).strip()
                     logger.error("agy CLI command failed with exit code %d: %s", process.returncode, err_msg)
                     raise RuntimeError(f"agy CLI execution failed (exit code {process.returncode}): {err_msg}")
 
@@ -238,7 +266,7 @@ class AntigravityLLM(LLMProvider):
                 )
 
                 if process.returncode != 0:
-                    err_msg = stderr.decode("utf-8", errors="replace")[:1000]
+                    err_msg = self._extract_error_message(stdout, stderr).strip()
                     logger.error("agy CLI command failed with exit code %d: %s", process.returncode, err_msg)
                     raise RuntimeError(f"agy CLI execution failed (exit code {process.returncode}): {err_msg}")
 
