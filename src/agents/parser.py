@@ -53,16 +53,101 @@ CRITICAL INSTRUCTIONS FOR CONTENT FORMATTING & OBSIDIAN SYNTAX:
 
 
 def extract_due_date_from_natural_language(text: str, ref_date: datetime | None = None) -> str | None:
-    """Extract YYYY-MM-DD due date from natural language time expressions like 'by Sunday', 'by tomorrow'."""
+    """Extract YYYY-MM-DD due date from natural language time expressions like 'by 30 aug', 'by Sunday', 'by tomorrow'."""
     now = ref_date or datetime.now()
     t = text.lower()
-    days_map = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3, "friday": 4, "saturday": 5, "sunday": 6}
 
+    # 1. Explicit ISO date format: YYYY-MM-DD or YYYY/MM/DD
+    iso_match = re.search(r"\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b", t)
+    if iso_match:
+        y, m, d = int(iso_match.group(1)), int(iso_match.group(2)), int(iso_match.group(3))
+        try:
+            return datetime(y, m, d).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+
+    # 2. Relative keywords
     if "tomorrow" in t:
         return (now + timedelta(days=1)).strftime("%Y-%m-%d")
     if "today" in t:
         return now.strftime("%Y-%m-%d")
 
+    months_map = {
+        "jan": 1, "january": 1,
+        "feb": 2, "february": 2,
+        "mar": 3, "march": 3,
+        "apr": 4, "april": 4,
+        "may": 5,
+        "jun": 6, "june": 6,
+        "jul": 7, "july": 7,
+        "aug": 8, "august": 8,
+        "sep": 9, "september": 9,
+        "oct": 10, "october": 10,
+        "nov": 11, "november": 11,
+        "dec": 12, "december": 12,
+    }
+    months_regex = "|".join(sorted(months_map.keys(), key=lambda x: -len(x)))
+
+    # 3. Day + Month: e.g. "30 aug", "30th august", "30 aug 2026", "by 30th of august"
+    day_month_match = re.search(
+        rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+(?:of\s+)?({months_regex})\b(?:,?\s+(\d{{4}}))?",
+        t,
+    )
+    if day_month_match:
+        d = int(day_month_match.group(1))
+        m = months_map[day_month_match.group(2)]
+        y = int(day_month_match.group(3)) if day_month_match.group(3) else now.year
+        if not day_month_match.group(3) and (m < now.month or (m == now.month and d < now.day)):
+            try:
+                dt_temp = datetime(y, m, d)
+                if (now - dt_temp).days > 7:
+                    y += 1
+            except ValueError:
+                pass
+        try:
+            return datetime(y, m, d).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+
+    # 4. Month + Day: e.g. "aug 30", "august 30th", "aug 30 2026"
+    month_day_match = re.search(
+        rf"\b({months_regex})\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:,?\s+(\d{{4}}))?\b",
+        t,
+    )
+    if month_day_match:
+        m = months_map[month_day_match.group(1)]
+        d = int(month_day_match.group(2))
+        y = int(month_day_match.group(3)) if month_day_match.group(3) else now.year
+        if not month_day_match.group(3) and (m < now.month or (m == now.month and d < now.day)):
+            try:
+                dt_temp = datetime(y, m, d)
+                if (now - dt_temp).days > 7:
+                    y += 1
+            except ValueError:
+                pass
+        try:
+            return datetime(y, m, d).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+
+    # 5. Short numeric date format: DD/MM or DD-MM (e.g., 30/08 or 30-08)
+    short_date_match = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{4}))?\b", t)
+    if short_date_match:
+        val1, val2 = int(short_date_match.group(1)), int(short_date_match.group(2))
+        y = int(short_date_match.group(3)) if short_date_match.group(3) else now.year
+        if val1 > 12:
+            d, m = val1, val2
+        elif val2 > 12:
+            m, d = val1, val2
+        else:
+            d, m = val1, val2
+        try:
+            return datetime(y, m, d).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+
+    # 6. Day names: e.g. "by Sunday", "on Monday"
+    days_map = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3, "friday": 4, "saturday": 5, "sunday": 6}
     for day_name, day_num in days_map.items():
         pattern = rf"\b(?:by|on|this|due)\s+{day_name}\b"
         if re.search(pattern, t):
@@ -80,11 +165,15 @@ def is_natural_language_task(text: str) -> bool:
     t = text.lower()
     indicators = [
         "required to", "need to", "needs to", "have to", "has to", "must ",
-        "remember to", "todo", "to-do", "should ", "due ", "finish ",
-        "by sunday", "by monday", "by tuesday", "by wednesday", "by thursday",
-        "by friday", "by saturday", "by tomorrow", "by today"
+        "remember to", "todo", "to-do", "should ", "due ", "finish ", "submit ",
+        "assignment", "by sunday", "by monday", "by tuesday", "by wednesday",
+        "by thursday", "by friday", "by saturday", "by tomorrow", "by today"
     ]
-    return any(ind in t for ind in indicators)
+    if any(ind in t for ind in indicators):
+        return True
+    if extract_due_date_from_natural_language(text) is not None:
+        return True
+    return False
 
 
 def normalize_obsidian_markdown(text: str) -> str:
@@ -236,11 +325,20 @@ class EntryParserAgent:
 
         logger.info("Parsing raw text into InterstitialEntry via EntryParserAgent")
         try:
-            entry = await self.llm.generate_json(
-                prompt=user_prompt,
-                schema_model=InterstitialEntry,
-                system_prompt=PARSER_SYSTEM_PROMPT,
-            )
+            try:
+                entry = await self.llm.generate_json(
+                    prompt=user_prompt,
+                    schema_model=InterstitialEntry,
+                    system_prompt=PARSER_SYSTEM_PROMPT,
+                )
+            except Exception as parse_err:
+                logger.warning("EntryParserAgent LLM structured parsing failed (%s). Falling back to raw text entry.", parse_err)
+                entry = InterstitialEntry(
+                    timestamp=entry_timestamp,
+                    category=category_hint or "general",
+                    content=raw_text.strip(),
+                    memory_type="observation",
+                )
 
             if not entry.timestamp:
                 entry.timestamp = entry_timestamp

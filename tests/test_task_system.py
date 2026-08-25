@@ -74,7 +74,7 @@ def test_parse_task_line_edge_cases():
 def test_natural_language_task_parsing():
     """Test natural language task detection and relative date calculation."""
     from datetime import datetime
-    from src.agents.parser import is_natural_language_task, extract_due_date_from_natural_language
+    from src.agents.parser import is_natural_language_task, extract_due_date_from_natural_language, enforce_task_syntax
 
     raw_input = "I am required to complete my fyp infra by sunday"
     assert is_natural_language_task(raw_input) is True
@@ -83,3 +83,21 @@ def test_natural_language_task_parsing():
     due = extract_due_date_from_natural_language(raw_input, ref_date=ref_date)
     assert due == "2026-08-23"  # Sunday
 
+    # Test "by 30 aug" case
+    assignment_input = "I need to do my assignment for ai and huamanity by 30 aug"
+    assert is_natural_language_task(assignment_input) is True
+    ref_date_aug = datetime(2026, 8, 25)
+    due_aug = extract_due_date_from_natural_language(assignment_input, ref_date=ref_date_aug)
+    assert due_aug == "2026-08-30"
+
+    # Test enforce_task_syntax with extracted due date
+    formatted = enforce_task_syntax(assignment_input, timestamp_str="2026-08-25 12:19", due_date=due_aug)
+    assert formatted == "- [ ] I need to do my assignment for ai and huamanity by 30 aug ➕ 2026-08-25 📅 2026-08-30"
+
+    # Test month first: "august 30th"
+    aug_first = "submit paper by august 30th"
+    assert extract_due_date_from_natural_language(aug_first, ref_date=ref_date_aug) == "2026-08-30"
+
+    # Test numeric format: "by 30/08"
+    numeric_date = "finish lab report by 30/08"
+    assert extract_due_date_from_natural_language(numeric_date, ref_date=ref_date_aug) == "2026-08-30"

@@ -4,9 +4,10 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 from typing import Any, TypeVar
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from src.config import settings
 from src.llm.base import LLMProvider
@@ -85,6 +86,10 @@ class AntigravityLLM(LLMProvider):
     def _clean_markdown_code_block(self, text: str) -> str:
         """Strip markdown triple backtick fences if present in JSON text."""
         cleaned = text.strip()
+        if "```" in cleaned:
+            match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
         if cleaned.startswith("```"):
             lines = cleaned.splitlines()
             if len(lines) >= 2 and lines[-1].startswith("```"):
@@ -93,18 +98,76 @@ class AntigravityLLM(LLMProvider):
                 return "\n".join(lines[1:]).strip()
         return cleaned
 
+    def _extract_json_substring(self, text: str) -> str:
+        """Extract outermost JSON object or array string from text if present."""
+        cleaned = self._clean_markdown_code_block(text)
+        if not cleaned:
+            return ""
+
+        try:
+            json.loads(cleaned)
+            return cleaned
+        except Exception:
+            pass
+
+        start_obj = cleaned.find("{")
+        end_obj = cleaned.rfind("}")
+        if start_obj != -1 and end_obj != -1 and end_obj > start_obj:
+            candidate = cleaned[start_obj : end_obj + 1].strip()
+            try:
+                json.loads(candidate)
+                return candidate
+            except Exception:
+                pass
+
+        start_arr = cleaned.find("[")
+        end_arr = cleaned.rfind("]")
+        if start_arr != -1 and end_arr != -1 and end_arr > start_arr:
+            candidate = cleaned[start_arr : end_arr + 1].strip()
+            try:
+                json.loads(candidate)
+                return candidate
+            except Exception:
+                pass
+
+        return cleaned
+
     def _extract_json_payload(self, output_text: str) -> dict[str, Any] | str:
         """Extract structured JSON payload or string response from agy CLI envelope."""
+        output_text = output_text.strip()
+        if not output_text:
+            return ""
+
         try:
             data = json.loads(output_text)
             if isinstance(data, dict):
+                # 1. Check for structured_output
                 if "structured_output" in data and data["structured_output"] is not None:
-                    return data["structured_output"]
-                if "response" in data and isinstance(data["response"], str):
-                    return self._clean_markdown_code_block(data["response"])
+                    so = data["structured_output"]
+                    if isinstance(so, dict):
+                        return so
+                    if isinstance(so, str) and so.strip():
+                        extracted = self._extract_json_substring(so)
+                        if extracted:
+                            return extracted
+
+                # 2. Check for response string
+                if "response" in data and isinstance(data["response"], str) and data["response"].strip():
+                    resp = self._extract_json_substring(data["response"])
+                    if resp:
+                        return resp
+
+                # 3. Check if data is an agy CLI envelope
+                is_agy_envelope = "status" in data or "conversation_id" in data
+                if is_agy_envelope:
+                    return ""
+
+                # 4. If data is a dict payload directly (not agy envelope), return it
+                return data
         except json.JSONDecodeError:
             pass
-        return self._clean_markdown_code_block(output_text)
+
+        return self._extract_json_substring(output_text)
 
     def _extract_error_message(self, stdout_bytes: bytes, stderr_bytes: bytes) -> str:
         """Extract human-readable error details from stdout and stderr of agy process.
@@ -213,6 +276,35 @@ class AntigravityLLM(LLMProvider):
                 logger.exception("Unexpected error during agy CLI text generation: %s", err)
                 raise
 
+    async def _exec_agy_subprocess(
+        self,
+        cmd: list[str],
+        combined_prompt: str,
+    ) -> tuple[int, bytes, bytes]:
+        """Execute agy subprocess wrapped with resource semaphore and cleanup handling."""
+        async with resource_manager.antigravity_semaphore:
+            process = None
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(input=combined_prompt.encode("utf-8")),
+                    timeout=self.timeout,
+                )
+                return process.returncode, stdout, stderr
+            except Exception:
+                if process and process.returncode is None:
+                    try:
+                        process.kill()
+                        await process.wait()
+                    except Exception:
+                        pass
+                raise
+
     async def generate_json(
         self,
         prompt: str,
@@ -251,56 +343,71 @@ class AntigravityLLM(LLMProvider):
             cmd.extend(["--effort", self.effort])
 
         logger.info("Executing agy CLI command for structured JSON generation")
-        async with resource_manager.antigravity_semaphore:
-            process = None
-            try:
-                process = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(input=combined_prompt.encode("utf-8")),
-                    timeout=self.timeout,
-                )
-
-                if process.returncode != 0:
-                    err_msg = self._extract_error_message(stdout, stderr).strip()
-                    logger.error("agy CLI command failed with exit code %d: %s", process.returncode, err_msg)
-                    raise RuntimeError(f"agy CLI execution failed (exit code {process.returncode}): {err_msg}")
-
+        last_err: Exception | None = None
+        try:
+            returncode, stdout, stderr = await self._exec_agy_subprocess(cmd, combined_prompt)
+            if returncode == 0:
                 output_str = stdout.decode("utf-8", errors="replace")
                 payload = self._extract_json_payload(output_str)
-
                 if isinstance(payload, dict):
                     return schema_model.model_validate(payload)
-                elif isinstance(payload, str):
+                elif isinstance(payload, str) and payload.strip():
                     return schema_model.model_validate_json(payload)
-                else:
-                    raise ValueError(f"Unexpected payload type from agy output: {type(payload)}")
+            else:
+                err_msg = self._extract_error_message(stdout, stderr).strip()
+                logger.warning("agy CLI command with --json-schema exited with code %d: %s", returncode, err_msg)
+        except asyncio.TimeoutError:
+            logger.error("agy CLI execution timed out after %d seconds", self.timeout)
+            raise TimeoutError(f"agy CLI execution timed out after {self.timeout} seconds")
+        except (json.JSONDecodeError, ValueError, ValidationError) as parse_err:
+            logger.warning("Initial agy CLI structured output validation failed for %s: %s", schema_model.__name__, parse_err)
+            last_err = parse_err
+        except Exception as err:
+            logger.warning("Initial agy CLI execution failed for %s: %s", schema_model.__name__, err)
+            last_err = err
 
-            except asyncio.TimeoutError:
-                if process:
-                    try:
-                        process.kill()
-                        await process.wait()
-                    except Exception:
-                        pass
-                logger.error("agy CLI execution timed out after %d seconds", self.timeout)
-                raise TimeoutError(f"agy CLI execution timed out after {self.timeout} seconds")
-            except (json.JSONDecodeError, ValueError) as parse_err:
-                logger.exception("Failed to parse JSON response from agy CLI output: %s", parse_err)
-                raise
-            except Exception as err:
-                if process and process.returncode is None:
-                    try:
-                        process.kill()
-                        await process.wait()
-                    except Exception:
-                        pass
-                logger.exception("Unexpected error during agy CLI structured JSON generation: %s", err)
-                raise
+        # Fallback attempt: Request JSON explicitly in prompt without --json-schema
+        logger.info("Retrying agy CLI generation with explicit JSON prompt fallback")
+        fallback_prompt = (
+            f"{combined_prompt}\n\n"
+            "CRITICAL REQUIREMENT: Respond ONLY with a valid JSON object matching this schema. "
+            "Do NOT include markdown backticks or any conversation:\n"
+            f"{schema_json}"
+        )
+        fallback_cmd = [
+            self.binary_path,
+            "--print",
+            "-",
+            "--output-format",
+            "json",
+        ]
+        if self.model:
+            fallback_cmd.extend(["--model", self.model])
+        if self.effort:
+            fallback_cmd.extend(["--effort", self.effort])
+
+        try:
+            returncode, stdout, stderr = await self._exec_agy_subprocess(fallback_cmd, fallback_prompt)
+            if returncode != 0:
+                err_msg = self._extract_error_message(stdout, stderr).strip()
+                raise RuntimeError(f"agy CLI execution failed (exit code {returncode}): {err_msg}")
+
+            output_str = stdout.decode("utf-8", errors="replace")
+            payload = self._extract_json_payload(output_str)
+            if isinstance(payload, dict):
+                return schema_model.model_validate(payload)
+            elif isinstance(payload, str) and payload.strip():
+                return schema_model.model_validate_json(payload)
+            else:
+                raise ValueError(f"Extracted payload was empty or invalid string: {payload!r}")
+        except asyncio.TimeoutError:
+            logger.error("Fallback agy CLI execution timed out after %d seconds", self.timeout)
+            raise TimeoutError(f"Fallback agy CLI execution timed out after {self.timeout} seconds")
+        except Exception as err:
+            logger.exception("Failed to parse JSON response from agy CLI output after fallback: %s", err)
+            if last_err:
+                raise ValueError(f"Failed to generate JSON for model {schema_model.__name__}: {err}") from last_err
+            raise
 
 
 __all__ = ["AntigravityLLM", "find_agy_executable"]

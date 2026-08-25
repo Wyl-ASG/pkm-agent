@@ -413,3 +413,69 @@ async def test_antigravity_llm_stderr_stripping():
 
         assert "agy CLI execution failed (exit code 1): Error: invalid --effort high3" in str(exc_info.value)
 
+
+@pytest.mark.asyncio
+async def test_antigravity_llm_generate_json_empty_output_fallback():
+    """Verify AntigravityLLM retries with explicit prompt fallback when initial agy output is empty."""
+    llm = AntigravityLLM(timeout=5)
+
+    # First call returns empty structured_output and empty response
+    proc1 = MagicMock()
+    proc1.returncode = 0
+    proc1.communicate = AsyncMock(return_value=(
+        b'{"conversation_id":"123","status":"SUCCESS","response":"","structured_output":null}',
+        b""
+    ))
+
+    # Fallback call returns valid JSON object in response
+    proc2 = MagicMock()
+    proc2.returncode = 0
+    proc2.communicate = AsyncMock(return_value=(
+        b'{"response":"```json\\n{\\"category\\": \\"task\\", \\"content\\": \\"Buy milk\\", \\"timestamp\\": \\"2026-08-25 12:00\\"}\\n```"}',
+        b""
+    ))
+
+    with patch("asyncio.create_subprocess_exec", side_effect=[proc1, proc2]) as mock_subproc:
+        entry = await llm.generate_json("Buy milk", InterstitialEntry)
+        assert entry.category == "task"
+        assert entry.content == "Buy milk"
+        assert entry.timestamp == "2026-08-25 12:00"
+        assert mock_subproc.call_count == 2
+
+
+def test_antigravity_llm_json_substring_extraction():
+    """Verify _extract_json_payload and _extract_json_substring handle various LLM formatting quirks."""
+    llm = AntigravityLLM(timeout=5)
+
+    # 1. Envelope with markdown code fence in response
+    raw1 = '{"status":"SUCCESS","response":"Here is JSON:\\n```json\\n{\\"category\\": \\"log\\", \\"content\\": \\"test\\"}\\n```"}'
+    res1 = llm._extract_json_payload(raw1)
+    assert res1 == '{"category": "log", "content": "test"}'
+
+    # 2. Envelope with empty response
+    raw2 = '{"status":"SUCCESS","response":"","structured_output":null}'
+    res2 = llm._extract_json_payload(raw2)
+    assert res2 == ""
+
+    # 3. Conversational text surrounding JSON object without backticks
+    raw3 = 'Sure! Here is your entry: {"category": "thought", "content": "idea"} Hope that helps.'
+    res3 = llm._extract_json_payload(raw3)
+    assert res3 == '{"category": "thought", "content": "idea"}'
+
+
+@pytest.mark.asyncio
+async def test_entry_parser_agent_fallback_on_llm_failure():
+    """Verify EntryParserAgent falls back to raw text InterstitialEntry when LLM fails."""
+    from src.agents.parser import EntryParserAgent
+
+    mock_llm = MagicMock()
+    mock_llm.generate_json = AsyncMock(side_effect=ValueError("Failed to parse JSON"))
+
+    parser = EntryParserAgent(llm=mock_llm)
+    entry = await parser.parse(raw_text="Random note text", timestamp="2026-08-25 12:00")
+
+    assert entry.content == "Random note text"
+    assert entry.timestamp == "2026-08-25 12:00"
+    assert entry.category == "general"
+
+
