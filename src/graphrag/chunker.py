@@ -10,6 +10,11 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
+DAILY_NOTES_DIR = "Daily Notes"
+HEADING_LINE = re.compile(r"^#{1,6}\s")
+# A new capture starts with an unindented list item or a callout.
+DAILY_ENTRY_START = re.compile(r"^(?:[-*+]\s|>\s*\[!)")
+
 
 def extract_wikilinks(text: str) -> list[str]:
     """Extract Obsidian WikiLink target note names from text, stripping aliases."""
@@ -118,6 +123,39 @@ def extract_tags_from_text(text: str) -> list[str]:
     return sorted(tags)
 
 
+def _split_daily_entries(block_lines: list[str]) -> list[list[str]]:
+    """Split a daily note section into separate captures, so unrelated notes never share a chunk."""
+    entries: list[list[str]] = []
+    current: list[str] = []
+    in_code_block = False
+
+    def finish_entry() -> None:
+        nonlocal current
+        if current:
+            entries.append(current)
+        current = []
+
+    for line in block_lines:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code_block = not in_code_block
+            current.append(line)
+        elif in_code_block:
+            current.append(line)
+        elif not stripped:
+            finish_entry()
+        elif HEADING_LINE.match(stripped):
+            continue
+        elif DAILY_ENTRY_START.match(line):
+            finish_entry()
+            current.append(line)
+        else:
+            current.append(line)
+
+    finish_entry()
+    return entries
+
+
 class StructureAwareChunker:
     """Structure-aware chunker that understands headings, code blocks, lists, callouts, and block IDs."""
 
@@ -177,6 +215,11 @@ class StructureAwareChunker:
         if not body.strip():
             return []
 
+        is_daily_note = (
+            str(frontmatter.get("type", "")) == "daily-note"
+            or Path(rel_path).parts[0] == DAILY_NOTES_DIR
+        )
+
         lines = body.splitlines()
         chunks: list[MarkdownChunk] = []
         chunk_idx = 0
@@ -188,21 +231,17 @@ class StructureAwareChunker:
         def get_heading_path() -> list[str]:
             return [h[1] for h in heading_stack]
 
-        def flush_current_block() -> None:
-            nonlocal chunk_idx, current_block_lines
-            if not current_block_lines:
-                return
-
-            block_text = "\n".join(current_block_lines).strip()
+        def add_chunk(block_lines: list[str]) -> None:
+            nonlocal chunk_idx
+            block_text = "\n".join(block_lines).strip()
             if not block_text:
-                current_block_lines = []
                 return
 
             block_wikilinks = extract_wikilinks(block_text)
             block_tags = sorted(base_tags.union(extract_tags_from_text(block_text)))
 
             found_block_ids = []
-            for b_line in current_block_lines:
+            for b_line in block_lines:
                 b_id = extract_block_id(b_line)
                 if b_id:
                     found_block_ids.append(f"^{b_id}")
@@ -228,7 +267,17 @@ class StructureAwareChunker:
             )
             chunks.append(chunk)
             chunk_idx += 1
-            current_block_lines = []
+
+        def flush_current_block() -> None:
+            nonlocal current_block_lines
+            block_lines, current_block_lines = current_block_lines, []
+            if all(not line.strip() or HEADING_LINE.match(line.strip()) for line in block_lines):
+                return  # A heading with nothing under it holds no knowledge.
+            if is_daily_note:
+                for entry_lines in _split_daily_entries(block_lines):
+                    add_chunk(entry_lines)
+            else:
+                add_chunk(block_lines)
 
         in_code_block = False
 

@@ -246,8 +246,7 @@ class HybridRetriever:
 
         if getattr(settings, "LOG_RETRIEVAL_DETAILS", True):
             logger.info(
-                "Retrieval Stats [query='%s']: dense=%d, sparse=%d, rrf=%d, graph_exp=%d, reranked=%d, final=%d, latency=%dms",
-                clean_query[:50],
+                "Retrieval Stats: dense=%d, sparse=%d, rrf=%d, graph_exp=%d, reranked=%d, final=%d, latency=%dms",
                 len(dense_hits),
                 len(sparse_hits),
                 rrf_candidate_count,

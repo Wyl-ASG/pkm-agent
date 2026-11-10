@@ -1,5 +1,7 @@
 """Unit tests for QA agent, block-level provenance formatting, and citations."""
 
+from unittest.mock import AsyncMock
+
 import pytest
 from src.agents.models import SourceCitation
 from src.agents.qa import KnowledgeBaseQAAgent
@@ -70,7 +72,14 @@ def test_telegram_html_and_markdown_formatting():
 @pytest.mark.asyncio
 async def test_qa_agent_with_mock_llm():
     mock_llm = MockLLM(default_text_response="You chose [[PostgreSQL]] for high reliability.")
-    agent = KnowledgeBaseQAAgent(llm=mock_llm)
+    retriever = AsyncMock()
+    retriever.search.return_value = [
+        {
+            "content": "Chose PostgreSQL for reliability.",
+            "payload": {"title": "Database Decision", "file_path": "Notes/Database Decision.md"},
+        }
+    ]
+    agent = KnowledgeBaseQAAgent(retriever=retriever, llm=mock_llm)
 
     response = await agent.query("What database did I choose?", top_k=3)
     assert response.query == "What database did I choose?"

@@ -141,7 +141,7 @@ async def send_telegram_message(
         True if all chunks sent successfully, False otherwise.
     """
     if not settings.TELEGRAM_BOT_TOKEN:
-        logger.warning("TELEGRAM_BOT_TOKEN not configured; logging message instead:\n%s", text)
+        logger.warning("TELEGRAM_BOT_TOKEN not configured; dropping %d-character message.", len(text))
         return False
 
     chunks = split_telegram_message(text, max_chunk_size=4000)
@@ -290,7 +290,8 @@ async def download_telegram_file(file_id: str) -> Path | None:
                 logger.info("Downloaded Telegram audio file (%d bytes) to %s", temp_file.stat().st_size, temp_file)
                 return temp_file
             except Exception as dl_err:
-                logger.error("Failed to download file from %s: %s", download_url, dl_err)
+                # The URL and httpx status errors contain the bot token, so log only the error type.
+                logger.error("Failed to download Telegram file %s: %s", file_id, type(dl_err).__name__)
                 return None
 
     except Exception as err:

@@ -5,8 +5,31 @@ import logging
 import re
 from typing import Sequence
 from src.config import settings
+from src.graphrag.sparse import STOPWORDS
 
 logger = logging.getLogger(__name__)
+
+MIN_LINK_TERM_LENGTH = 3
+
+# Markdown that must never gain a link: links, Dataview fields, callouts, code, URLs, dates, tags, block IDs.
+_PROTECTED_MARKDOWN = re.compile(
+    r"(\[\[[^\]\n]*\]\]"
+    r"|\[[^\[\]\n]*::[^\[\]\n]*\]"
+    r"|\[![A-Za-z]+\]"
+    r"|`[^`\n]*`"
+    r"|https?://\S+"
+    r"|(?:➕|📅)\s*\d{4}-\d{2}-\d{2}"
+    r"|(?<!\S)[#^][\w/-]+)"
+)
+
+
+def _mention_pattern(term: str) -> re.Pattern[str]:
+    """Build a whole-word, case-insensitive pattern for a term and its simple plural or singular."""
+    if len(term) > MIN_LINK_TERM_LENGTH and term.endswith("s") and not term.endswith("ss"):
+        body = f"{re.escape(term[:-1])}s?"
+    else:
+        body = f"{re.escape(term)}(?:s|es)?"
+    return re.compile(rf"(?<!\w){body}(?!\w)", re.IGNORECASE)
 
 
 def string_similarity(a: str, b: str) -> float:
@@ -60,7 +83,7 @@ class WikiLinkResolver:
         self.existing_notes = list(notes)
         self._note_title_set = set(self.existing_notes)
         self._lower_to_canonical = {n.lower().strip(): n for n in self.existing_notes}
-        if alias_map:
+        if alias_map is not None:
             self.alias_map = dict(alias_map)
 
     def score_candidate(self, proposed_term: str, candidate_title: str) -> float:
@@ -147,6 +170,48 @@ class WikiLinkResolver:
             return best_candidate, best_score
 
         return None, best_score
+
+    def _linkable_terms(self) -> list[tuple[str, str]]:
+        """Return (term, note title) pairs, longest first, skipping aliases of notes that no longer exist."""
+        terms: dict[str, str] = {}
+        for alias, title in self.alias_map.items():
+            if title in self._note_title_set:
+                terms[alias.lower().strip()] = title
+        for title in self.existing_notes:
+            terms[title.lower().strip()] = title
+        usable = [
+            (term, title)
+            for term, title in terms.items()
+            if len(term) >= MIN_LINK_TERM_LENGTH and term not in STOPWORDS
+        ]
+        return sorted(usable, key=lambda pair: len(pair[0]), reverse=True)
+
+    def link_known_notes(self, text: str) -> str:
+        """Link the first mention of each existing note, leaving every visible word unchanged.
+
+        Only exact titles, known aliases, and simple plurals match. Fuzzy matching is
+        deliberately not used here because a wrong link is worse than a missing one.
+        """
+        linked_text = text
+        linked_titles: set[str] = set()
+        for term, title in self._linkable_terms():
+            if title in linked_titles:
+                continue
+            pattern = _mention_pattern(term)
+            parts = _PROTECTED_MARKDOWN.split(linked_text)
+            for index, part in enumerate(parts):
+                # Odd positions hold protected markdown captured by the split.
+                if index % 2 == 1:
+                    continue
+                match = pattern.search(part)
+                if match:
+                    mention = match.group(0)
+                    link = f"[[{title}]]" if mention == title else f"[[{title}|{mention}]]"
+                    parts[index] = f"{part[:match.start()]}{link}{part[match.end():]}"
+                    linked_titles.add(title)
+                    break
+            linked_text = "".join(parts)
+        return linked_text
 
     def format_wikilink_safe(self, proposed_term: str, display_text: str | None = None) -> str:
         """Format a WikiLink safely: if resolved to existing note, format as [[Canonical|Display]] or [[Canonical]].

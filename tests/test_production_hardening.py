@@ -159,7 +159,8 @@ def test_git_failure_preserves_local_markdown(tmp_path):
     assert daily_path.exists()
     assert "Important meeting notes about deployment" in daily_path.read_text(encoding="utf-8")
 
-    # 2. Simulate Git push failure (e.g. no remote or network disconnect)
+    # 2. Simulate Git push failure with a remote that cannot be reached
+    engine.repo.create_remote("origin", str(tmp_path / "missing-remote.git"))
     push_ok = engine.push_sync()
     assert push_ok is False
 
@@ -476,6 +477,6 @@ async def test_entry_parser_agent_fallback_on_llm_failure():
 
     assert entry.content == "Random note text"
     assert entry.timestamp == "2026-08-25 12:00"
-    assert entry.category == "general"
+    assert entry.category == "log"
 
 

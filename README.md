@@ -4,7 +4,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.13-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110%2B-009688.svg)](https://fastapi.tiangolo.com/)
-[![Tests](https://img.shields.io/badge/tests-43%20passed-brightgreen.svg)](#testing)
+[![Tests](https://github.com/Wyl-ASG/pkm-agent/actions/workflows/tests.yml/badge.svg)](#testing)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 > **Status:** Personal production project / active development.
@@ -338,7 +338,7 @@ GIT_BRANCH=main
   - **Ollama** — for self-hosted local model endpoints (`http://localhost:11434`)
   - **Mock LLM** — built-in stub for headless testing and development
 
-> **Important:** `MockLLM` is a deterministic fallback stub intended for testing and development. Verify the active LLM provider with `python main.py health` before running in production.
+> **Important:** `MockLLM` returns fake output and is only used when `LLM_PROVIDER=mock` is set explicitly. If the configured provider is unavailable, the server refuses to start.
 
 [Back to top ↑](#pkm-ai-agent--second-brain-via-telegram)
 
@@ -405,6 +405,8 @@ All configuration is managed through [`src/config.py`](src/config.py) using `pyd
 | `LLM_EFFORT` | `None` | Reasoning effort for `agy`: `low`, `medium`, or `high`. |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server API base URL. |
 | `OLLAMA_MODEL` | `llama3.2` | Model name for Ollama inference. |
+| `OLLAMA_THINK` | `False` | Let Ollama models that support thinking use it. |
+| `OLLAMA_TEMPERATURE` | `0.0` | Sampling temperature for Ollama. `0` gives the most repeatable answers. |
 | `EMBEDDING_MODEL_NAME` | `all-MiniLM-L6-v2` | SentenceTransformer model identifier (384 dimensions). |
 | `EMBEDDING_DEVICE` | `cpu` | Device for embedding inference: `cpu`, `cuda`, `mps`, or `auto`. |
 
@@ -467,12 +469,37 @@ All configuration is managed through [`src/config.py`](src/config.py) using `pyd
 ### Starting the Application
 
 ```bash
-# Development mode (with live reload)
+# Production mode (binds to APP_HOST:APP_PORT, default 127.0.0.1:8000)
 python main.py
 
-# Or directly with uvicorn:
-uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
+# Development mode with live reload
+python main.py --reload
 ```
+
+The server binds to localhost by default. Expose it through a reverse proxy such as Nginx.
+
+### Local Development with a Telegram Bot
+
+Polling needs no public URL. Create a separate bot with @BotFather, because Telegram refuses polling for a bot with a webhook set, and polling never removes one. Put its settings in `.env.dev.local`, which is gitignored and overrides your other env files:
+
+```ini
+TELEGRAM_BOT_TOKEN=your_dev_bot_token
+TELEGRAM_SECRET_TOKEN=any_random_string
+LLM_PROVIDER=ollama
+OLLAMA_MODEL=your_model
+VAULT_PATH=./vault_data
+QDRANT_STORAGE_PATH=./qdrant_dev_data
+GIT_REPO_URL=
+SSH_KEY_PATH=
+```
+
+Your user ID must also be in `ALLOWED_TELEGRAM_USER_IDS`. Then run:
+
+```bash
+python main.py poll
+```
+
+Messages are processed one at a time and confirmed to Telegram only after they are handled, so anything sent while the bot is stopped is picked up when it restarts.
 
 ### CLI Commands
 
@@ -811,8 +838,13 @@ curl -s "http://127.0.0.1:8000/health"
 - **Embedding Dimension Integrity:** Vector collections in Qdrant are locked to the dimension of `EMBEDDING_MODEL_NAME` (e.g. 384 for `all-MiniLM-L6-v2`). Changing models against an existing collection raises a `ValueError` to prevent index corruption. To migrate models, clear `./qdrant_storage` and run `python main.py reindex --force`.
 - **Task Serialization:** `MAX_BACKGROUND_JOBS=1` strictly serializes indexing, Git sync, and consolidation via a semaphore to prevent CPU/RAM contention on low-resource instances.
 - **Whisper Memory Management:** The `faster-whisper` model loads lazily on the first audio memo and unloads after `WHISPER_IDLE_TIMEOUT_SECONDS` (180s) of inactivity to free RAM for query retrieval.
-- **Git Merge Conflict Handling:** The Git engine uses `pull --rebase`. If upstream changes conflict with local writes, the rebase is aborted and a `GitConflictError` is logged.
-- **LLM Fallback Behavior:** When `LLM_PROVIDER=antigravity`, if the `agy` binary is not discovered in system paths, the system falls back to `MockLLM`. Run `python main.py health` to verify the active LLM driver.
+- **Git Merge Conflict Handling:** The Git engine uses `pull --rebase` after a rejected push. If upstream changes conflict with local writes, the rebase is aborted and the conflict is logged.
+- **LLM Availability:** If the configured LLM provider is unavailable, the server refuses to start and `/health` returns HTTP 503. This checks that the provider can be set up, not that its login or API access is still valid. Run `python main.py health` to see the active LLM driver.
+- **Raw Capture Log:** The exact text of every capture is appended to `.pkm_state/captures/YYYY-MM.jsonl` in the vault before LLM processing, and is committed with the vault. `/reset` deletes it along with your notes.
+- **Wrongly Filed Tasks:** Task confirmations include a **Not a task** button that moves the entry to the Log section and records the correction in the capture log. It leaves the entry alone if the task changed since capture, and it covers the 200 most recent tasks.
+- **Existing Notes:** Atomic notes never overwrite an existing note. A new note with a matching title is saved as `Title (2).md`.
+- **Mass Deletions:** Deleting more than 50 files sends a Telegram alert. The deletion is still committed, and the files remain in Git history.
+- **Vault `.gitignore`:** The agent adds `.vault_hashes.json`, `*.lock`, and `.*.tmp` to the vault's `.gitignore` and stops tracking matching files.
 
 [Back to top ↑](#pkm-ai-agent--second-brain-via-telegram)
 
@@ -906,7 +938,7 @@ pkm-agent/
 │   └── utils/
 │       └── resources.py       # Concurrency semaphores and memory pressure monitor
 │
-└── tests/                     # Test suite (43 tests across 12 files)
+└── tests/                     # Test suite, isolated from real config by conftest.py
     ├── test_production_hardening.py
     ├── test_retrieval.py
     ├── test_task_system.py
@@ -956,6 +988,6 @@ This project is open source and available under the [MIT License](LICENSE).
 ## Contact & Connect
 
 - LinkedIn: [Wen Yiluan](https://www.linkedin.com/in/wen-yiluan)
-- GitHub: [@yiluan](https://github.comi/Wyl-ASG)
+- GitHub: [@yiluan](https://github.com/Wyl-ASG)
 
 [Back to top ↑](#pkm-ai-agent--second-brain-via-telegram)

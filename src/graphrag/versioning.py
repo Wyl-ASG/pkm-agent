@@ -13,7 +13,7 @@ from src.config import settings
 logger = logging.getLogger(__name__)
 
 CURRENT_EMBEDDING_VERSION = "2.0"
-CURRENT_CHUNKER_VERSION = "2.0"
+CURRENT_CHUNKER_VERSION = "2.1"
 CURRENT_PARSER_VERSION = "2.0"
 HASH_REGISTRY_FILENAME = ".vault_hashes.json"
 

@@ -21,6 +21,8 @@ class OllamaLLM(LLMProvider):
         base_url: str = "http://localhost:11434",
         model: str = "llama3.2",
         timeout: float = 120.0,
+        think: bool = False,
+        temperature: float = 0.0,
     ) -> None:
         """Initialize Ollama LLM provider.
 
@@ -28,10 +30,14 @@ class OllamaLLM(LLMProvider):
             base_url: Base URL of running Ollama server.
             model: Model tag (e.g. 'llama3.2', 'mistral', 'qwen2.5').
             timeout: Request timeout in seconds.
+            think: Whether models that support thinking should use it.
+            temperature: Sampling temperature. 0 gives the most repeatable answers.
         """
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout = timeout
+        self.think = think
+        self.temperature = temperature
 
     async def generate_text(
         self,
@@ -48,6 +54,8 @@ class OllamaLLM(LLMProvider):
         payload = {
             "model": self.model,
             "messages": messages,
+            "think": self.think,
+            "options": {"temperature": self.temperature},
             "stream": False,
         }
 
@@ -75,6 +83,8 @@ class OllamaLLM(LLMProvider):
             "model": self.model,
             "messages": messages,
             "format": schema_json,
+            "think": self.think,
+            "options": {"temperature": self.temperature},
             "stream": False,
         }
 

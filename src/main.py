@@ -12,6 +12,7 @@ from typing import Any
 import uuid
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from src.agents.consolidation import KnowledgeConsolidator
@@ -31,7 +32,8 @@ from src.graphrag.retriever import HybridRetriever
 from src.graphrag.sparse import BM25Index
 from src.graphrag.vector_db import get_vector_store
 from src.graphrag.watcher import VaultWatcher
-from src.llm.factory import get_llm_provider
+from src.llm.factory import LazyLLMProvider
+from src.telegram.polling import run_polling
 from src.telegram import (
     TelegramUpdate,
     answer_telegram_callback_query,
@@ -42,15 +44,12 @@ from src.telegram import (
     is_task_query_intent,
     send_telegram_message,
 )
+from src.utils.logging_setup import configure_logging
 from src.utils.resources import resource_manager, resource_monitor
 from src.vault.git_engine import VaultGitEngine
 from src.vault.md_writer import ObsidianVaultWriter
 
-# Standardized logging setup
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+configure_logging()
 logger = logging.getLogger(__name__)
 
 # Global shared singleton component instances (lazy-loaded as needed)
@@ -90,7 +89,7 @@ vault_watcher = (
     else None
 )
 
-llm_driver = get_llm_provider()
+llm_driver = LazyLLMProvider()
 wiki_resolver = WikiLinkResolver(confidence_threshold=settings.WIKILINKS_CONFIDENCE_THRESHOLD)
 parser_agent = EntryParserAgent(llm=llm_driver, resolver=wiki_resolver)
 qa_agent = KnowledgeBaseQAAgent(
@@ -104,6 +103,10 @@ consolidator = KnowledgeConsolidator(
     knowledge_graph=knowledge_graph,
     llm=llm_driver,
 )
+
+
+# Telegram allows 64 bytes of callback data, and "done:YYYY-MM-DD:" uses 16 of them.
+MAX_DONE_SNIPPET_BYTES = 48
 
 
 async def run_startup_reindex() -> None:
@@ -151,6 +154,10 @@ async def lifespan(app: FastAPI):
         "FastAPI application starting up (Profile: %s, 2 vCPU / 4 GB Target)...",
         settings.APP_PROFILE,
     )
+
+    # Refuse to start with a broken LLM or vector store rather than failing later or faking output.
+    llm_driver.resolve()
+    vector_store.probe()
 
     # 1. Ensure master Dashboard note exists in Obsidian vault
     try:
@@ -215,7 +222,7 @@ app = FastAPI(
 
 async def process_telegram_tasks_query(chat_id: int, query_text: str = "") -> None:
     """Handle request for pending tasks list, render formatted template, and reply with interactive buttons."""
-    logger.info("Processing pending tasks query for chat %d: '%s'", chat_id, query_text)
+    logger.info("Processing pending tasks query for chat %d", chat_id)
     try:
         tasks = await vault_writer.get_all_tasks_async(include_completed=False)
         message_text, inline_buttons = format_pending_tasks_message(
@@ -295,7 +302,7 @@ async def daily_task_digest_scheduler() -> None:
 
 async def process_telegram_query(chat_id: int, query_text: str) -> None:
     """Process search query from Telegram via /ask, perform hybrid multi-stage search, and synthesize QA answer."""
-    logger.info("Processing Telegram query for chat %d: '%s'", chat_id, query_text)
+    logger.info("Processing Telegram query for chat %d (%d chars)", chat_id, len(query_text))
     try:
         response = await qa_agent.query(
             query_text=query_text,
@@ -326,11 +333,19 @@ async def process_telegram_consolidation(chat_id: int) -> None:
 _background_tasks: set[asyncio.Task] = set()
 
 
+async def _commit_and_send_alerts(commit_msg: str, expected_mass_deletion: bool = False) -> None:
+    """Commit and push vault changes, then tell the owner about anything Git flagged."""
+    await git_engine.commit_and_push(commit_msg, expected_mass_deletion=expected_mass_deletion)
+    for alert in git_engine.pop_alerts():
+        for chat_id in settings.ALLOWED_TELEGRAM_USER_IDS:
+            await send_telegram_message(chat_id, f"⚠️ {alert}")
+
+
 async def _safe_git_commit_and_push(commit_msg: str) -> None:
     """Execute Git commit+push under the background job semaphore to prevent .git/index.lock collisions."""
     async with resource_manager.background_job_semaphore:
         try:
-            await git_engine.commit_and_push(commit_msg)
+            await _commit_and_send_alerts(commit_msg)
         except Exception as err:
             logger.warning("Background git sync failed: %s", err)
 
@@ -351,7 +366,7 @@ async def _async_background_post_ingestion(
 
             # 3. Git Commit and Push
             commit_msg = f"Vault update: {entry.category} entry at {entry.timestamp}"
-            await git_engine.commit_and_push(commit_msg)
+            await _commit_and_send_alerts(commit_msg)
 
         except Exception as err:
             logger.warning("Background post-ingestion indexing or git sync encountered issue: %s", err)
@@ -366,6 +381,13 @@ async def process_telegram_ingestion(
     """Process Telegram ingestion: Parse -> Write Markdown -> Send user confirmation -> Background index & Git."""
     logger.info("Processing Telegram capture for chat %d (modality=%s)", chat_id, modality)
 
+    # Save the exact input first, so it survives LLM rewrites and processing failures.
+    capture_id: str | None = None
+    try:
+        capture_id = await vault_writer.append_capture_event_async(raw_text, modality=modality.value)
+    except Exception as log_err:
+        logger.exception("Could not write raw capture log: %s", log_err)
+
     try:
         # 1. Fetch existing vault note titles for entity grounding
         existing_notes = await vault_writer.get_existing_note_titles_async()
@@ -374,6 +396,7 @@ async def process_telegram_ingestion(
         entry: InterstitialEntry = await parser_agent.parse(
             raw_text=raw_text,
             existing_notes=existing_notes,
+            note_aliases=knowledge_graph.alias_to_title,
         )
 
         # 3. Atomic Note Confidence Decision
@@ -400,14 +423,16 @@ async def process_telegram_ingestion(
         # 4. Write Markdown to Obsidian Daily Note & optional atomic note immediately on disk
         daily_note_path, atomic_note_path = await vault_writer.append_interstitial_entry_async(entry)
         entry.requires_atomic_note = original_requires
+        if capture_id:
+            await vault_writer.record_capture_outcome_async(capture_id, "stored", daily_note_path.name)
 
         # 5. Build user confirmation reply with interactive inline keyboard
         confirmation = f"✅ **Entry Logged** ({entry.category})\n"
         confirmation += f"📄 **Content**: {entry.content}\n"
         if entry.extracted_wikilinks:
             confirmation += f"🔗 **WikiLinks**: {', '.join(['[[' + w + ']]' for w in entry.extracted_wikilinks])}\n"
-        if atomic_note_path and entry.atomic_note_title:
-            confirmation += f"📌 **Atomic Note Created**: [[{entry.atomic_note_title}]]\n"
+        if atomic_note_path:
+            confirmation += f"📌 **Atomic Note Created**: [[{atomic_note_path.stem}]]\n"
 
         # Build inline action buttons
         inline_buttons: list[list[dict[str, str]]] = []
@@ -422,14 +447,21 @@ async def process_telegram_ingestion(
         )
         if is_task:
             task_snippet = entry.content[:30].replace(":", "")
-            inline_buttons.append([
-                {"text": "✅ Mark Done", "callback_data": f"done:{date_str}:{task_snippet}"}
-            ])
+            task_snippet = task_snippet.encode("utf-8")[:MAX_DONE_SNIPPET_BYTES].decode("utf-8", "ignore")
+            task_buttons = [{"text": "✅ Mark Done", "callback_data": f"done:{date_str}:{task_snippet}"}]
+            try:
+                correction_id = await vault_writer.save_task_correction_async(
+                    entry, daily_note_path, atomic_note_path, capture_id
+                )
+                task_buttons.append({"text": "↩️ Not a task", "callback_data": f"not_task:{correction_id}"})
+            except Exception as correction_err:
+                logger.exception("Could not save task correction: %s", correction_err)
+            inline_buttons.append(task_buttons)
 
-        if atomic_note_path and entry.atomic_note_title:
-            btn_title = entry.atomic_note_title
+        if atomic_note_path:
+            btn_title = atomic_note_path.stem
             btn_label = btn_title if len(btn_title) <= 24 else btn_title[:21] + "..."
-            cb_title = entry.atomic_note_title.encode("utf-8")[:58].decode("utf-8", "ignore")
+            cb_title = btn_title.encode("utf-8")[:58].decode("utf-8", "ignore")
             inline_buttons.append([
                 {
                     "text": f"📌 View [[{btn_label}]]",
@@ -444,15 +476,21 @@ async def process_telegram_ingestion(
             if entry.atomic_note_reason:
                 confirmation += f"_{entry.atomic_note_reason}_\n"
             btn_label = proposal_note_title if len(proposal_note_title) <= 20 else proposal_note_title[:17] + "..."
-            cb_prop = proposal_note_title.encode("utf-8")[:48].decode("utf-8", "ignore")
+            proposal_id = await vault_writer.save_pending_proposal_async({
+                "title": proposal_note_title,
+                "content": entry.atomic_note_content or entry.content,
+                "tags": entry.extracted_tags,
+                "timestamp": entry.timestamp,
+                "daily_note": daily_note_path.stem,
+            })
             inline_buttons.append([
                 {
                     "text": f"✨ Create [[{btn_label}]]",
-                    "callback_data": f"create_atomic:{cb_prop}",
+                    "callback_data": f"create_atomic:{proposal_id}",
                 },
                 {
                     "text": "❌ Ignore",
-                    "callback_data": f"ignore_atomic:{cb_prop}",
+                    "callback_data": f"ignore_atomic:{proposal_id}",
                 }
             ])
 
@@ -473,7 +511,15 @@ async def process_telegram_ingestion(
 
     except Exception as err:
         logger.exception("Failed to process Telegram capture for chat %d: %s", chat_id, err)
-        await send_telegram_message(chat_id, "⚠️ Failed to log entry to vault.")
+        if capture_id:
+            try:
+                await vault_writer.record_capture_outcome_async(capture_id, "failed")
+            except Exception as log_err:
+                logger.exception("Could not record capture failure: %s", log_err)
+        await send_telegram_message(
+            chat_id,
+            "⚠️ Failed to file this entry in your notes. The original text was saved in the capture log.",
+        )
 
 
 async def process_telegram_audio_ingestion(
@@ -504,7 +550,7 @@ async def process_telegram_audio_ingestion(
             )
             return
 
-        logger.info("Voice transcription completed for chat %d: '%s'", chat_id, full_content)
+        logger.info("Voice transcription completed for chat %d (%d chars)", chat_id, len(full_content))
         await send_telegram_message(chat_id, f"🎙️ **Transcribed**: *\"{full_content}\"*")
         await process_telegram_ingestion(chat_id, full_content, modality=ModalityType.VOICE)
 
@@ -598,8 +644,8 @@ async def process_telegram_reset_db(chat_id: int) -> None:
             
             deleted_count = await asyncio.to_thread(_wipe_vault)
             
-            # Commit and push, bypassing the self-recovery mechanism so the deletion is permanent
-            await git_engine.commit_and_push("Vault reset: wiped all notes", bypass_recovery=True)
+            # This deletion was explicitly requested, so it should not raise a mass-deletion alert.
+            await _commit_and_send_alerts("Vault reset: wiped all notes", expected_mass_deletion=True)
             await send_telegram_message(chat_id, f"✅ *Database successfully reset.* (Deleted {deleted_count} notes/files)")
         except Exception as err:
             logger.exception("Database reset failed: %s", err)
@@ -611,12 +657,34 @@ async def process_telegram_reset_db(chat_id: int) -> None:
 # ==============================================================================
 
 
+def _active_llm_name() -> str | None:
+    """Return the provider actually in use, or None if it cannot be used."""
+    try:
+        return type(llm_driver.resolve()).__name__
+    except Exception as err:
+        logger.error("LLM provider unavailable: %s", err)
+        return None
+
+
+def _qdrant_status() -> str:
+    """Check the vector store for real instead of assuming it works."""
+    try:
+        vector_store.probe()
+        return "ok"
+    except Exception as err:
+        logger.error("Vector store unavailable: %s", err)
+        return "error"
+
+
 @app.get("/health")
-async def health_check() -> dict[str, Any]:
+async def health_check() -> JSONResponse:
     """Comprehensive service health and resource diagnostics endpoint."""
     metrics = resource_monitor.get_metrics()
-    return {
-        "status": "healthy",
+    active_llm = _active_llm_name()
+    qdrant_status = await asyncio.to_thread(_qdrant_status)
+    is_healthy = active_llm is not None and qdrant_status == "ok"
+    payload = {
+        "status": "healthy" if is_healthy else "degraded",
         "service": "pkm-agent",
         "version": "2.1.0",
         "profile": settings.APP_PROFILE,
@@ -630,7 +698,7 @@ async def health_check() -> dict[str, Any]:
             "memory_pressure": metrics.under_memory_pressure,
         },
         "components": {
-            "qdrant": "ok",
+            "qdrant": qdrant_status,
             "watcher": "active" if vault_watcher else "disabled",
             "embedding": {
                 "model": embedder.model_name,
@@ -648,6 +716,7 @@ async def health_check() -> dict[str, Any]:
             },
             "llm": {
                 "provider": settings.LLM_PROVIDER,
+                "active": active_llm,
             },
             "knowledge_graph": {
                 "notes_count": len(knowledge_graph.nodes),
@@ -658,6 +727,7 @@ async def health_check() -> dict[str, Any]:
             },
         },
     }
+    return JSONResponse(content=payload, status_code=200 if is_healthy else 503)
 
 
 from fastapi import Depends, Header, HTTPException
@@ -712,6 +782,9 @@ async def trigger_vault_consolidation() -> ConsolidationProposal:
     """Run knowledge consolidation and evolution report on demand under background job semaphore."""
     async with resource_manager.background_job_semaphore:
         return await consolidator.generate_consolidation_report()
+
+
+PROPOSAL_ID_PATTERN = re.compile(r"^[0-9a-f]{12}$")
 
 
 @app.post("/webhook/telegram")
@@ -800,7 +873,7 @@ async def telegram_webhook(
                         await edit_telegram_message_text(
                             chat_id=chat_id,
                             message_id=update.callback_query.message.message_id,
-                            text=f"{orig_text}\n\n✨ *[Status: Marked Complete in Vault]*",
+                            text=f"{orig_text}\n\n✨ *Status: Marked Complete in Vault*",
                         )
                     else:
                         try:
@@ -835,13 +908,35 @@ async def telegram_webhook(
                             await edit_telegram_message_text(
                                 chat_id=chat_id,
                                 message_id=update.callback_query.message.message_id,
-                                text=f"{orig_text}\n\n✨ *[Completed: {display_name[:50]}]*",
+                                text=f"{orig_text}\n\n✨ *Completed: {display_name[:50]}*",
                             )
             else:
                 await answer_telegram_callback_query(
                     cb_id, text="⚠️ Task already completed or not found."
                 )
             return {"status": "callback_handled"}
+
+        elif cb_data.startswith("not_task:"):
+            correction_id = cb_data.replace("not_task:", "").strip()
+            moved = await vault_writer.apply_task_correction_async(correction_id)
+            if not moved:
+                await answer_telegram_callback_query(
+                    cb_id, text="⚠️ This entry changed or was already moved, so I left it alone."
+                )
+                return {"status": "task_correction_unavailable"}
+
+            await answer_telegram_callback_query(cb_id, text="↩️ Moved out of your tasks.")
+            task = asyncio.create_task(_safe_git_commit_and_push("Moved wrongly filed task to Log"))
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
+            if update.callback_query.message:
+                orig_text = update.callback_query.message.text or ""
+                await edit_telegram_message_text(
+                    chat_id=chat_id,
+                    message_id=update.callback_query.message.message_id,
+                    text=f"{orig_text}\n\n✨ *Moved out of tasks to Log*",
+                )
+            return {"status": "task_correction_applied"}
 
         elif cb_data.startswith("view:"):
             note_title = cb_data.replace("view:", "").strip()
@@ -873,15 +968,30 @@ async def telegram_webhook(
             return {"status": "callback_handled"}
 
         elif cb_data.startswith("create_atomic:"):
-            proposed_title = cb_data.replace("create_atomic:", "").strip()
-            await answer_telegram_callback_query(cb_id, text=f"✅ Created [[{proposed_title}]]")
-            created_path = await vault_writer.create_atomic_note_async(
-                title=proposed_title,
-                content=f"# {proposed_title}\n\nConcept captured and approved via Telegram.",
-                tags=["atomic-note", "approved"],
-            )
+            proposal_ref = cb_data.replace("create_atomic:", "").strip()
+            if PROPOSAL_ID_PATTERN.match(proposal_ref):
+                proposal = await vault_writer.pop_pending_proposal_async(proposal_ref)
+                if proposal is None:
+                    await answer_telegram_callback_query(cb_id, text="⚠️ This proposal was already handled.")
+                    return {"status": "atomic_note_proposal_missing"}
+                created_path = await vault_writer.create_atomic_note_async(
+                    title=proposal["title"],
+                    content=proposal["content"],
+                    tags=proposal.get("tags") or ["atomic-note", "approved"],
+                    timestamp=proposal.get("timestamp"),
+                    daily_note_name=proposal.get("daily_note"),
+                )
+            else:
+                # Buttons sent before proposals were stored only carry a title.
+                created_path = await vault_writer.create_atomic_note_async(
+                    title=proposal_ref,
+                    content=f"# {proposal_ref}\n\nConcept captured and approved via Telegram.",
+                    tags=["atomic-note", "approved"],
+                )
+            created_title = created_path.stem
+            await answer_telegram_callback_query(cb_id, text=f"✅ Created [[{created_title}]]")
             task = asyncio.create_task(
-                _safe_git_commit_and_push(f"Created atomic note [[{proposed_title}]] via Telegram approval")
+                _safe_git_commit_and_push(f"Created atomic note [[{created_title}]] via Telegram approval")
             )
             _background_tasks.add(task)
             task.add_done_callback(_background_tasks.discard)
@@ -890,18 +1000,21 @@ async def telegram_webhook(
                 await edit_telegram_message_text(
                     chat_id=chat_id,
                     message_id=update.callback_query.message.message_id,
-                    text=f"{orig_text}\n\n✨ *[Approved & Created Note: [[{proposed_title}]]]*",
+                    text=f"{orig_text}\n\n✨ *Approved & Created Note: [[{created_title}]]*",
                 )
             return {"status": "atomic_note_created"}
 
         elif cb_data.startswith("ignore_atomic:"):
+            proposal_ref = cb_data.replace("ignore_atomic:", "").strip()
+            if PROPOSAL_ID_PATTERN.match(proposal_ref):
+                await vault_writer.pop_pending_proposal_async(proposal_ref)
             await answer_telegram_callback_query(cb_id, text="Proposal dismissed.")
             if update.callback_query.message:
                 orig_text = update.callback_query.message.text or ""
                 await edit_telegram_message_text(
                     chat_id=chat_id,
                     message_id=update.callback_query.message.message_id,
-                    text=f"{orig_text}\n\n✨ *[Note Proposal Dismissed]*",
+                    text=f"{orig_text}\n\n✨ *Note Proposal Dismissed*",
                 )
             return {"status": "atomic_note_ignored"}
 
@@ -1036,6 +1149,8 @@ async def get_pending_tasks_endpoint() -> dict[str, Any]:
 @app.post("/tasks/complete", dependencies=[Depends(verify_api_key)])
 async def mark_task_complete_endpoint(req: MarkTaskRequest) -> dict[str, Any]:
     """Mark a task complete in the vault via API."""
+    if not req.task_id and not req.task_pattern:
+        raise HTTPException(status_code=400, detail="Provide task_id or task_pattern.")
     marked, note_name, task_text = await vault_writer.mark_task_by_id_or_pattern_async(
         task_id=req.task_id or "",
         daily_date=req.daily_date or "",
@@ -1075,12 +1190,12 @@ def print_health_report() -> None:
     print(f"CPU Utilization:       {metrics.cpu_percent}%")
     print(f"Memory Pressure State: {'⚠️ HIGH PRESSURE' if metrics.under_memory_pressure else '✅ NORMAL'}")
     print("-" * 60)
-    print(f"Qdrant Vector Store:   OK (Collection: '{settings.QDRANT_COLLECTION_NAME}')")
+    print(f"Qdrant Vector Store:   {_qdrant_status().upper()} (Collection: '{settings.QDRANT_COLLECTION_NAME}')")
     print(f"Real-Time Watcher:     {'ACTIVE' if vault_watcher else 'DISABLED'}")
     print(f"Embedding Model:       {embedder.model_name} (loaded: {embedder.is_loaded}, device: {embedder.resolved_device})")
     print(f"CrossEncoder Reranker: {reranker.model_name} (enabled: {reranker.enabled}, loaded: {reranker.is_loaded})")
     print(f"Whisper Transcriber:   faster-whisper (model: {audio_transcriber.model_size}, loaded: {audio_transcriber.is_loaded})")
-    print(f"LLM Provider:          {settings.LLM_PROVIDER} ({llm_driver.__class__.__name__})")
+    print(f"LLM Provider:          {settings.LLM_PROVIDER} (active: {_active_llm_name() or 'UNAVAILABLE'})")
     print(f"Knowledge Graph:       {len(knowledge_graph.nodes)} notes, {knowledge_graph.graph.number_of_edges()} WikiLink edges")
     print(f"BM25 Lexical Index:    {len(bm25_index.documents)} document chunks indexed")
 
@@ -1093,6 +1208,11 @@ def cli_entrypoint() -> None:
     """CLI handler supporting 'reindex', 'evaluate', 'health', and web server start."""
     if len(sys.argv) > 1 and sys.argv[1] == "health":
         print_health_report()
+    elif len(sys.argv) > 1 and sys.argv[1] == "poll":
+        try:
+            asyncio.run(run_polling(app))
+        except KeyboardInterrupt:
+            logger.info("Telegram polling stopped.")
     elif len(sys.argv) > 1 and sys.argv[1] == "reindex":
         force = "--force" in sys.argv or "-f" in sys.argv
         print(f"🔄 Starting Vault reindexing (force={force})...")
@@ -1128,7 +1248,12 @@ def cli_entrypoint() -> None:
         print(f"✅ Evaluation Results:\n{metrics.to_dict()}")
     else:
         import uvicorn
-        uvicorn.run("src.main:app", host="0.0.0.0", port=8000, reload=True)
+        uvicorn.run(
+            "src.main:app",
+            host=settings.APP_HOST,
+            port=settings.APP_PORT,
+            reload="--reload" in sys.argv,
+        )
 
 
 if __name__ == "__main__":

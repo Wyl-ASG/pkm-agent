@@ -13,6 +13,9 @@ from src.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Agent-generated files that must never enter vault history.
+INTERNAL_IGNORE_PATTERNS = (".vault_hashes.json", "*.lock", ".*.tmp")
+
 
 def get_ssh_command(ssh_key_path: str | Path | None = None) -> str:
     """Construct SSH command string with identity file if configured and exists."""
@@ -55,6 +58,13 @@ class GitEngine:
         self._repo: git.Repo | None = None
         self._thread_lock = threading.RLock()
         self._async_lock: asyncio.Lock | None = None
+        self._alerts: list[str] = []
+
+    def pop_alerts(self) -> list[str]:
+        """Return and clear warnings that should be shown to the vault owner."""
+        with self._thread_lock:
+            alerts, self._alerts = self._alerts, []
+            return alerts
 
     def _get_async_lock(self) -> asyncio.Lock:
         """Lazily initialize asyncio.Lock inside running event loop."""
@@ -124,7 +134,8 @@ class GitEngine:
     def _repair_broken_head(self) -> bool:
         """Detect and repair dangling or missing HEAD commit objects in the Git repository."""
         try:
-            self.repo.git.rev_parse("--verify", "HEAD")
+            # ^{commit} also verifies the commit object exists; plain HEAD only reads the ref.
+            self.repo.git.rev_parse("--verify", "HEAD^{commit}")
             return True
         except Exception as err:
             logger.warning("Local HEAD reference is invalid or points to missing commit: %s. Attempting repair...", err)
@@ -297,20 +308,36 @@ class GitEngine:
                 logger.exception("Unexpected error during git pull: %s", err)
                 return False
 
-    def _recover_mass_deletion(self) -> bool:
-        """Detect mass deletion and restore files from HEAD to trigger re-index."""
+    def _alert_on_mass_deletion(self) -> None:
+        """Warn about a large deletion without changing the working tree; git history keeps the files."""
         try:
-            # Use optimized raw git command to list only deleted files fast
             diff_out = self.repo.git.diff("--name-only", "--diff-filter=D")
             deleted_files = diff_out.splitlines() if diff_out else []
             threshold = getattr(settings, 'MASS_DELETION_THRESHOLD', 50)
             if len(deleted_files) > threshold:
-                logger.warning("Mass deletion detected (%d files). Assuming database reset. Restoring from git HEAD...", len(deleted_files))
-                self.repo.git.checkout("--", ".")
-                return True
+                message = (
+                    f"{len(deleted_files)} vault files were deleted and are being committed. "
+                    "If this was not intended, restore them from Git history."
+                )
+                logger.error("Mass deletion detected: %s", message)
+                self._alerts.append(message)
         except Exception as e:
-            logger.error("Error during mass deletion recovery: %s", e)
-        return False
+            logger.error("Error checking for mass deletion: %s", e)
+
+    def _exclude_internal_files(self) -> None:
+        """Keep agent-generated files out of vault history, including ones already tracked."""
+        gitignore = self.vault_path / ".gitignore"
+        existing = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
+        present = {line.strip() for line in existing.splitlines()}
+        missing = [p for p in INTERNAL_IGNORE_PATTERNS if p not in present]
+        if missing:
+            prefix = existing if not existing or existing.endswith("\n") else f"{existing}\n"
+            gitignore.write_text(prefix + "\n".join(missing) + "\n", encoding="utf-8")
+            self.repo.git.add("--", ".gitignore")
+
+        tracked = self.repo.git.ls_files("--", *INTERNAL_IGNORE_PATTERNS)
+        if tracked:
+            self.repo.git.rm("--cached", "--quiet", "--", *tracked.splitlines())
 
     def commit_sync(self, message: str, file_paths: list[str | Path] | None = None) -> bool:
         """Stage and commit changes synchronously without creating empty commits.
@@ -325,7 +352,8 @@ class GitEngine:
         with self._thread_lock:
             try:
                 self.repo.git.update_environment(GIT_SSH_COMMAND=self.ssh_command)
-                self._recover_mass_deletion()
+                self._alert_on_mass_deletion()
+                self._exclude_internal_files()
 
                 if file_paths:
                     rel_paths: list[str] = []
@@ -390,13 +418,14 @@ class GitEngine:
                 logger.error("Git push failed: %s", err, exc_info=True)
                 return False
 
-    def commit_and_push_sync(self, commit_message: str, bypass_recovery: bool = False) -> bool:
+    def commit_and_push_sync(self, commit_message: str, expected_mass_deletion: bool = False) -> bool:
         """Stage all changes, commit if dirty, and push to origin branch synchronously."""
         with self._thread_lock:
             try:
                 self.repo.git.update_environment(GIT_SSH_COMMAND=self.ssh_command)
-                if not bypass_recovery:
-                    self._recover_mass_deletion()
+                if not expected_mass_deletion:
+                    self._alert_on_mass_deletion()
+                self._exclude_internal_files()
                 self.repo.git.add(A=True)
 
                 commit_ok = self._safe_commit(commit_message)
@@ -475,10 +504,10 @@ class GitEngine:
         async with self._get_async_lock():
             return await asyncio.to_thread(self.push_sync)
 
-    async def commit_and_push(self, commit_message: str, bypass_recovery: bool = False) -> bool:
+    async def commit_and_push(self, commit_message: str, expected_mass_deletion: bool = False) -> bool:
         """Asynchronously stage all changes, commit if dirty, and push to origin."""
         async with self._get_async_lock():
-            return await asyncio.to_thread(self.commit_and_push_sync, commit_message, bypass_recovery)
+            return await asyncio.to_thread(self.commit_and_push_sync, commit_message, expected_mass_deletion)
 
     async def sync(self, commit_message: str) -> bool:
         """Execute full pull (rebase) -> commit -> push sync sequence asynchronously."""

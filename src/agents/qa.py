@@ -16,20 +16,40 @@ from src.llm.factory import get_llm_provider
 logger = logging.getLogger(__name__)
 
 QA_SYSTEM_PROMPT = """You are an expert Personal Knowledge Management (PKM) AI assistant for an Obsidian vault.
-Answer the user's question clearly, structured, and concisely using the provided vault context.
+Answer the user's question directly and briefly using only the provided vault context.
 
 CRITICAL ANSWERING RULES:
-1. Ground every statement strictly in the provided Vault Context. Never invent facts or hallucinate external information.
-2. If the context does NOT contain enough information to answer, state clearly:
+1. Every statement must come from the Vault Context. Never add outside knowledge, even when you are sure it is true.
+2. Treat each Source as a separate note. Never combine statements from different Sources into one claim unless a Source itself states the connection.
+3. If a note uses a pronoun or has no clear subject (e.g. 'It was replaced by X'), do not assume what it refers to. Report it as written, and say the subject is unclear if that matters.
+4. Answer only what was asked. Leave out related facts that do not answer the question, and do not speculate about reasons or causes the notes do not state.
+5. If the context does NOT contain enough information to answer, state clearly:
    "I couldn't find evidence in your vault that confirms this."
-3. Distinguish direct user evidence from inference: if making a deduction, explicitly state it as an inference.
-4. STRUCTURE & FORMATTING:
-   - Format lists with standard Markdown bullet points ('- ') or numbers ('1. ') for every item and sub-item. Never use bare indented text without bullet markers.
-   - Use clear bold section titles (e.g. '### 1. Core Infrastructure' or '**1. Core Infrastructure**').
-5. WIKILINKS SYNTAX:
-   - Wrap technical terms, cloud services, concepts, and note references in Obsidian DOUBLE-BRACKET WikiLinks (e.g. [[Microsoft Azure]], [[Azure Functions]], [[Serverless Computing|Serverless]]).
-   - NEVER output single brackets for WikiLinks or aliases (NEVER output [Azure] or [Serverless|serverless]).
-6. Sources and fine-grained citations will be automatically appended by the provenance engine, so do not invent a Sources section."""
+6. FORMATTING:
+   - A single fact gets a single sentence, with no heading. Use '- ' bullets only for several items.
+   - Do not add WikiLinks, a Sources section, or mentions of source numbers in your answer text.
+7. END your reply with one final line listing the numbers of the Sources you actually used, for example:
+   SOURCES: 1, 3
+   If you used none, write:
+   SOURCES: none"""
+
+_SOURCES_LINE = re.compile(r"^\W*sources?\W*:\W*(.*)$", re.IGNORECASE)
+
+
+def _split_used_sources(answer: str, source_count: int) -> tuple[str, list[int] | None]:
+    """Separate the model's final source line, returning None when it did not provide a usable one."""
+    lines = answer.rstrip().splitlines()
+    match = _SOURCES_LINE.match(lines[-1].strip()) if lines else None
+    if not match:
+        return answer.strip(), None
+
+    value = match.group(1).strip().lower()
+    numbers = [int(n) for n in re.findall(r"\d+", value)]
+    if not numbers and "none" not in value:
+        return answer.strip(), None
+
+    used = [n for n in dict.fromkeys(numbers) if 1 <= n <= source_count]
+    return "\n".join(lines[:-1]).strip(), used
 
 
 class KnowledgeBaseQAAgent:
@@ -70,7 +90,7 @@ class KnowledgeBaseQAAgent:
             )
 
         target_top_k = top_k or getattr(settings, "RETRIEVAL_FINAL_TOP_K", 5)
-        logger.info("Executing knowledge base query: '%s' (top_k=%d)", clean_query, target_top_k)
+        logger.info("Executing knowledge base query (%d chars, top_k=%d)", len(clean_query), target_top_k)
 
         try:
             # 1. Multi-stage hybrid search
@@ -156,11 +176,28 @@ class KnowledgeBaseQAAgent:
                 prompt=user_prompt,
                 system_prompt=QA_SYSTEM_PROMPT,
             )
-            normalized_answer = normalize_obsidian_markdown(raw_answer.strip())
+            answer_text, used_sources = _split_used_sources(raw_answer, len(citations))
+            normalized_answer = normalize_obsidian_markdown(answer_text)
+
+            # An answer that found nothing has no sources, whatever search happened to return.
+            if "couldn't find evidence" in normalized_answer.replace("’", "'").lower():
+                return QueryResponse(
+                    query=clean_query,
+                    answer=normalized_answer,
+                    sources=[],
+                    citations=[],
+                    context_chunks=context_chunks,
+                )
+
+            # Keep only the sources the model says it used. Without that, label results as unverified.
+            if used_sources is not None:
+                citations = [citations[number - 1] for number in used_sources]
+                sources = list(dict.fromkeys(f"[[{c.note_title}]]" for c in citations))
 
             # Append block-level provenance citations section
             if getattr(settings, "PROVENANCE_ENABLED", True) and citations:
-                citation_lines = ["\n\n**Sources:**"]
+                citation_title = "**Sources:**" if used_sources is not None else "**Search results, not verified as used:**"
+                citation_lines = [f"\n\n{citation_title}"]
                 seen_citations = set()
                 for c in citations:
                     c_formatted = c.format_citation()
@@ -179,7 +216,7 @@ class KnowledgeBaseQAAgent:
             )
 
         except Exception as err:
-            logger.exception("Failed to query knowledge base for '%s': %s", clean_query, err)
+            logger.exception("Failed to query knowledge base: %s", err)
             return QueryResponse(
                 query=clean_query,
                 answer="⚠️ Sorry, an error occurred while processing your query.",

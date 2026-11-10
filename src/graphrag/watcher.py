@@ -16,7 +16,7 @@ from src.config import settings
 from src.graphrag.chunker import StructureAwareChunker
 from src.graphrag.embedder import TextEmbedder
 from src.graphrag.graph import VaultKnowledgeGraph
-from src.graphrag.reindexer import IGNORED_DIRS
+from src.graphrag.reindexer import IGNORED_DIRS, IGNORED_FILES
 from src.graphrag.sparse import BM25Index
 from src.graphrag.vector_db import QdrantVectorStore, get_vector_store
 from src.graphrag.versioning import (
@@ -91,11 +91,17 @@ class VaultChangeHandler(FileSystemEventHandler):
         if not event.is_directory:
             self._handle_delete_path(event.src_path)
 
+    def on_moved(self, event: FileSystemEvent) -> None:
+        """Triggered on rename, which is also how atomic saves replace a file."""
+        if not event.is_directory:
+            self._handle_delete_path(event.src_path)
+            self._handle_event_path(event.dest_path)
+
     def _should_ignore(self, path: Path) -> bool:
         """Check if file should be ignored from indexing."""
         if path.suffix.lower() != ".md":
             return True
-        if path.name.startswith("."):
+        if path.name.startswith(".") or path.name in IGNORED_FILES:
             return True
         try:
             rel = path.relative_to(self.vault_path)
@@ -129,6 +135,7 @@ class VaultChangeHandler(FileSystemEventHandler):
         """Remove deleted file metadata from indices under semaphore."""
         try:
             rel_path = str(path.relative_to(self.vault_path))
+            await self.vector_store.delete_file_chunks_async(rel_path)
             if self.bm25_index:
                 await asyncio.to_thread(self.bm25_index.remove_file_chunks, rel_path)
             if self.knowledge_graph:
@@ -139,7 +146,7 @@ class VaultChangeHandler(FileSystemEventHandler):
                 await asyncio.to_thread(self.registry.save)
             logger.info("Removed deleted file '%s' from indices.", rel_path)
         except Exception as err:
-            logger.debug("Error handling delete path %s: %s", path, err)
+            logger.exception("Error handling delete path %s: %s", path, err)
 
     async def _async_debounce_worker(self) -> None:
         """Async worker that polls debounced queue and processes ready files under background job semaphore."""
@@ -161,6 +168,13 @@ class VaultChangeHandler(FileSystemEventHandler):
 
                 ready_deletes = list(self._pending_deletes)
                 self._pending_deletes.clear()
+
+            # An atomic save can report a deletion even though the file is still there.
+            for del_path_str in list(ready_deletes):
+                if Path(del_path_str).exists():
+                    ready_deletes.remove(del_path_str)
+                    if del_path_str not in ready_paths:
+                        ready_paths.append(del_path_str)
 
             if not ready_paths and not ready_deletes:
                 continue
@@ -209,7 +223,12 @@ class VaultChangeHandler(FileSystemEventHandler):
 
         logger.info("File watcher detected incremental modification in: %s", rel_path)
         chunks = await asyncio.to_thread(self.chunker.chunk_file, file_path, self.vault_path)
+
+        # Chunk IDs depend on position, so remove old chunks or shortened notes would leave stale text.
+        await self.vector_store.delete_file_chunks_async(rel_path)
         if not chunks:
+            if self.bm25_index:
+                await asyncio.to_thread(self.bm25_index.remove_file_chunks, rel_path)
             return
 
         chunk_texts = [c.content for c in chunks]
@@ -229,7 +248,9 @@ class VaultChangeHandler(FileSystemEventHandler):
             })
 
         # 1. Update Qdrant
-        await self.vector_store.upsert_documents_async(documents_to_upsert)
+        if not await self.vector_store.upsert_documents_async(documents_to_upsert):
+            logger.error("Could not store chunks for '%s'; it will be retried on the next change.", rel_path)
+            return
 
         # 2. Update BM25 incrementally
         if self.bm25_index:

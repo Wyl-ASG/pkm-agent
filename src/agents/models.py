@@ -1,8 +1,8 @@
 """Pydantic data models for agent schema validation, provenance, and LLM interactions."""
 
 from enum import Enum
-from typing import Any
-from pydantic import BaseModel, ConfigDict, Field
+from typing import Any, Literal
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class MemoryType(str, Enum):
@@ -53,21 +53,51 @@ class SourceCitation(BaseModel):
         return "\n".join(lines)
 
 
+EntryCategory = Literal["task", "discovery", "log", "inbox"]
+
+_CATEGORY_ALIASES: dict[str, EntryCategory] = {
+    "task": "task",
+    "tasks": "task",
+    "priority": "task",
+    "priorities": "task",
+    "todo": "task",
+    "to-do": "task",
+    "discovery": "discovery",
+    "discoveries": "discovery",
+    "learning": "discovery",
+    "learn": "discovery",
+    "fact": "discovery",
+    "knowledge": "discovery",
+    "insight": "discovery",
+    "inbox": "inbox",
+    "capture": "inbox",
+    "quick capture": "inbox",
+    "quick_capture": "inbox",
+}
+
+
+def normalize_category(value: object) -> EntryCategory:
+    """Return the daily note section for a category, using the log for anything unrecognized."""
+    return _CATEGORY_ALIASES.get(str(value or "").strip().lower(), "log")
+
+
 class InterstitialEntry(BaseModel):
     """Schema representing an interstitial journal entry with extracted metadata and atomic note options."""
 
     timestamp: str = Field(
         description="Timestamp of the entry in ISO 8601 or HH:MM format.",
     )
-    category: str = Field(
-        default="general",
-        description="Category classification of the entry (e.g. log, task, discovery, thought).",
+    category: EntryCategory = Field(
+        default="log",
+        description=(
+            "Daily note section for the entry: 'task' (a future action the user committed to), "
+            "'discovery' (knowledge or something learned), 'log' (something that happened or a passing thought), "
+            "or 'inbox' (unclear items to sort later)."
+        ),
     )
     content: str = Field(
         description=(
-            "Raw or processed markdown text content of the interstitial entry. "
-            "For tasks (category='task'), format with Obsidian Tasks syntax: "
-            "'- [ ] {Task Name} ➕ YYYY-MM-DD 📅 YYYY-MM-DD'."
+            "The user's exact text, copied without changes or added formatting."
         ),
     )
     extracted_tags: list[str] = Field(
@@ -83,7 +113,9 @@ class InterstitialEntry(BaseModel):
         description="Flag indicating whether an independent atomic note should be generated.",
     )
     atomic_note_confidence: float = Field(
-        default=0.9,
+        default=0.0,
+        ge=0.0,
+        le=1.0,
         description="Confidence score (0.0 to 1.0) regarding whether this concept warrants an atomic note.",
     )
     atomic_note_title: str | None = Field(
@@ -123,6 +155,12 @@ class InterstitialEntry(BaseModel):
         str_strip_whitespace=True,
         use_enum_values=True,
     )
+
+    @field_validator("category", mode="before")
+    @classmethod
+    def _normalize_category(cls, value: object) -> str:
+        """Map any category an LLM returns onto a real daily note section."""
+        return normalize_category(value)
 
 
 class QueryRequest(BaseModel):

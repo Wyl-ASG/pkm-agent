@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_COLLECTION_NAME = "pkm_notes"
 DEFAULT_VECTOR_SIZE = 384
+SCROLL_BATCH_SIZE = 1000
 
 
 class QdrantVectorStore:
@@ -64,8 +65,8 @@ class QdrantVectorStore:
             self._port = port or settings.QDRANT_PORT
             self._in_memory = in_memory
             self._storage_path = storage_path or settings.QDRANT_STORAGE_PATH
+            # Opened on first use: embedded Qdrant takes an exclusive lock on its storage folder.
             self._client: QdrantClient | None = None
-            self._init_client()
             self._initialized = True
 
     def _init_client(self) -> None:
@@ -93,20 +94,24 @@ class QdrantVectorStore:
             self._client = QdrantClient(host=self._host, port=self._port, timeout=10.0)
             self._client.get_collections()
         except Exception as err:
-            logger.warning(
-                "Could not connect to Qdrant server at %s:%s (%s); falling back to in-memory client.",
-                self._host,
-                self._port,
-                err,
-            )
-            self._client = QdrantClient(":memory:")
+            self._client = None
+            raise ConnectionError(
+                f"Could not connect to Qdrant server at {self._host}:{self._port}: {err}"
+            ) from err
 
     @property
     def client(self) -> QdrantClient:
-        """Return the initialized shared QdrantClient instance."""
+        """Return the shared QdrantClient instance, opening it on first use."""
         if self._client is None:
-            self._init_client()
+            with self._op_lock:
+                if self._client is None:
+                    self._init_client()
         return self._client
+
+    def probe(self) -> None:
+        """Raise if the vector store cannot actually be reached."""
+        with self._op_lock:
+            self.client.get_collections()
 
     def close(self) -> None:
         """Safely close Qdrant storage connection on shutdown."""
@@ -248,6 +253,47 @@ class QdrantVectorStore:
                         logger.exception("Failed to upsert points into Qdrant collection '%s' after %d attempts: %s", self.collection_name, max_retries, err)
                         return False
             return False
+
+    def delete_file_chunks(self, file_path: str) -> None:
+        """Delete every stored chunk belonging to one vault file."""
+        with self._op_lock:
+            if not self.client.collection_exists(self.collection_name):
+                return
+            self.client.delete(
+                collection_name=self.collection_name,
+                points_selector=models.FilterSelector(
+                    filter=models.Filter(
+                        must=[models.FieldCondition(key="file_path", match=models.MatchValue(value=file_path))]
+                    )
+                ),
+            )
+
+    def indexed_file_paths(self) -> set[str]:
+        """Return the vault file paths that currently have stored chunks."""
+        with self._op_lock:
+            if not self.client.collection_exists(self.collection_name):
+                return set()
+            paths: set[str] = set()
+            offset = None
+            while True:
+                points, offset = self.client.scroll(
+                    collection_name=self.collection_name,
+                    limit=SCROLL_BATCH_SIZE,
+                    offset=offset,
+                    with_payload=["file_path"],
+                    with_vectors=False,
+                )
+                paths.update(p.payload["file_path"] for p in points if p.payload and p.payload.get("file_path"))
+                if offset is None:
+                    return paths
+
+    async def delete_file_chunks_async(self, file_path: str) -> None:
+        """Asynchronously delete every stored chunk belonging to one vault file."""
+        await asyncio.to_thread(self.delete_file_chunks, file_path)
+
+    async def indexed_file_paths_async(self) -> set[str]:
+        """Asynchronously return the vault file paths that have stored chunks."""
+        return await asyncio.to_thread(self.indexed_file_paths)
 
     def search_dense(
         self,

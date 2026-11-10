@@ -136,11 +136,11 @@ class AudioTranscriber:
             full_text = " ".join(transcription_parts).strip()
             self._update_last_used()
             logger.info(
-                "Transcribed audio (%s, language: %s, duration: %.1fs): '%s'",
+                "Transcribed audio (%s, language: %s, duration: %.1fs, %d chars)",
                 path_obj.name,
                 info.language,
                 info.duration,
-                full_text,
+                len(full_text),
             )
             return full_text
         except Exception as err:

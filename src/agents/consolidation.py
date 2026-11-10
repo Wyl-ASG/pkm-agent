@@ -1,5 +1,6 @@
 """Knowledge consolidation and evolution analysis engine for non-destructive maintenance."""
 
+import asyncio
 from datetime import datetime
 from difflib import SequenceMatcher
 import logging

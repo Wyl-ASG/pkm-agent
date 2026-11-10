@@ -14,6 +14,15 @@ class Settings(BaseSettings):
         description="Deployment profile: 'production-small' (2 vCPU / 4 GB RAM) or 'performance'.",
     )
 
+    APP_HOST: str = Field(
+        default="127.0.0.1",
+        description="Address the web server binds to. Keep private and expose it through a reverse proxy.",
+    )
+    APP_PORT: int = Field(
+        default=8000,
+        description="Port the web server listens on.",
+    )
+
     TELEGRAM_BOT_TOKEN: str = Field(
         default="",
         description="API token for Telegram Bot authentication.",
@@ -191,6 +200,15 @@ class Settings(BaseSettings):
         default="llama3.2",
         description="Model tag for Ollama LLM provider.",
     )
+    OLLAMA_THINK: bool = Field(
+        default=False,
+        description="Whether Ollama models that support thinking should use it. Off keeps captures fast.",
+    )
+    OLLAMA_TEMPERATURE: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="Sampling temperature for Ollama. 0 gives the most repeatable answers.",
+    )
 
     # Audio Transcription & Watcher
     WHISPER_MODEL_SIZE: str = Field(
@@ -305,7 +323,8 @@ class Settings(BaseSettings):
         return None
 
     model_config = SettingsConfigDict(
-        env_file=(".env.local", ".env"),
+        # Later files win. .env.dev.local exists only on development machines.
+        env_file=(".env.local", ".env", ".env.dev.local"),
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,

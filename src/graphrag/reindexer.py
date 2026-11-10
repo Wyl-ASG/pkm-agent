@@ -23,6 +23,8 @@ from src.graphrag.vector_db import QdrantVectorStore, get_vector_store
 
 logger = logging.getLogger(__name__)
 IGNORED_DIRS = {".git", ".obsidian", ".trash", ".agent", ".venv", "__pycache__"}
+# Generated boilerplate that contains no knowledge and would otherwise appear as an answer source.
+IGNORED_FILES = {"Dashboard.md"}
 
 
 def chunk_markdown_file(file_path: Path, vault_path: Path) -> list[dict[str, Any]]:
@@ -61,7 +63,7 @@ class VaultReindexer:
                 parts = set(path.relative_to(self.vault_path).parts)
                 if parts.intersection(IGNORED_DIRS):
                     continue
-                if path.name.startswith("."):
+                if path.name.startswith(".") or path.name in IGNORED_FILES:
                     continue
                 if path.is_file():
                     md_files.append(path)
@@ -108,6 +110,21 @@ class VaultReindexer:
 
         return files_to_process, all_vault_chunks, skipped_count
 
+    async def _prune_removed_files(self, scanned_files: list[Path]) -> int:
+        """Remove stored chunks for files that are gone from the vault or are no longer indexed."""
+        current = {str(path.relative_to(self.vault_path)) for path in scanned_files}
+        indexed = await self.vector_store.indexed_file_paths_async()
+        removed = indexed - current
+        for rel_path in removed:
+            await self.vector_store.delete_file_chunks_async(rel_path)
+
+        # Also drop registry entries with no chunks, so a file that returns is indexed again.
+        for rel_path in (removed | set(self.registry.records)) - current:
+            self.registry.remove_file(rel_path)
+        if removed:
+            logger.info("Removed stored chunks for %d files no longer in the index scope.", len(removed))
+        return len(removed)
+
     async def reindex_vault(self, force: bool = False) -> dict[str, Any]:
         """Scan vault, detect stale files via versioned registry, upsert chunks to Qdrant, and update graph."""
         logger.info("Starting vault re-indexing (path=%s, force=%s)", self.vault_path, force)
@@ -126,6 +143,7 @@ class VaultReindexer:
             self._evaluate_and_chunk_files, scanned_files, force, current_model_name
         )
         self.cached_chunks = all_vault_chunks
+        pruned_count = await self._prune_removed_files(scanned_files)
 
         # Update Knowledge Graph asynchronously
         try:
@@ -142,6 +160,7 @@ class VaultReindexer:
                 "scanned": scanned_count,
                 "indexed": 0,
                 "skipped": skipped_count,
+                "pruned": pruned_count,
                 "chunks": 0,
                 "total_vault_chunks": len(all_vault_chunks),
             }
@@ -159,13 +178,10 @@ class VaultReindexer:
                     "content": c.content,
                     "metadata": c.to_dict(),
                 })
-            self.registry.record_indexed(
-                rel_path=rel_path,
-                content_hash=current_hash,
-                embedding_model=current_model_name,
-                chunks_count=len(chunks),
-            )
+            # Chunk IDs depend on position, so remove old chunks or shortened notes would leave stale text.
+            await self.vector_store.delete_file_chunks_async(rel_path)
 
+        stored_ok = True
         if new_documents:
             chunk_texts = [d["content"] for d in new_documents]
             logger.info("Generating embeddings for %d chunks using '%s'...", len(chunk_texts), current_model_name)
@@ -180,8 +196,21 @@ class VaultReindexer:
                     "metadata": doc["metadata"],
                 })
 
-            await self.vector_store.upsert_documents_async(qdrant_payloads)
-            total_chunks_indexed = len(qdrant_payloads)
+            stored_ok = await self.vector_store.upsert_documents_async(qdrant_payloads)
+            if stored_ok:
+                total_chunks_indexed = len(qdrant_payloads)
+            else:
+                logger.error("Could not store chunks; these files will be retried on the next reindex.")
+
+        # Only record files as indexed once their chunks are really stored
+        if stored_ok:
+            for file_path, current_hash, chunks in files_to_process:
+                self.registry.record_indexed(
+                    rel_path=str(file_path.relative_to(self.vault_path)),
+                    content_hash=current_hash,
+                    embedding_model=current_model_name,
+                    chunks_count=len(chunks),
+                )
 
         # Save updated versioned registry asynchronously
         await asyncio.to_thread(self.registry.save)
@@ -190,6 +219,7 @@ class VaultReindexer:
             "scanned": scanned_count,
             "indexed": indexed_files_count,
             "skipped": skipped_count,
+            "pruned": pruned_count,
             "chunks": total_chunks_indexed,
             "total_vault_chunks": len(all_vault_chunks),
         }
@@ -223,5 +253,6 @@ __all__ = [
     "reindex_vault",
     "chunk_markdown_file",
     "IGNORED_DIRS",
+    "IGNORED_FILES",
     "HASH_REGISTRY_FILENAME",
 ]
