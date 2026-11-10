@@ -26,7 +26,7 @@ A self-hosted Telegram bot that acts as your AI second brain, backed by your Obs
 sudo apt install -y python3 python3-pip python3-venv git curl
 git clone https://github.com/Wyl-ASG/pkm-agent.git && cd pkm-agent
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.txt -c constraints.txt
 cp .env.example .env.local   # fill in tokens + vault SSH key
 python3 main.py health       # verify everything is wired up
 ```
@@ -125,7 +125,7 @@ I built this AI agent to turn my Obsidian vault into an active second brain — 
 | **Sparse Retrieval** | `rank-bm25` (BM25Plus with WikiLink tokenizer) | [`src/graphrag/sparse.py`](src/graphrag/sparse.py) |
 | **Knowledge Graph** | `networkx` (in-memory `DiGraph` for WikiLinks) | [`src/graphrag/graph.py`](src/graphrag/graph.py) |
 | **Reranker (Optional)** | `sentence-transformers` CrossEncoder (`ms-marco-MiniLM-L-6-v2`, disabled by default) | [`src/graphrag/reranker.py`](src/graphrag/reranker.py) |
-| **LLM Provider** | Antigravity CLI (`agy`, external subprocess) · Ollama · Mock | [`src/llm/factory.py`](src/llm/factory.py) |
+| **LLM Provider** | Antigravity CLI (`agy`, external subprocess) · OpenRouter · Ollama · Mock | [`src/llm/factory.py`](src/llm/factory.py) |
 | **Audio Transcription** | `faster-whisper` (lazy singleton, CPU int8) | [`src/agents/transcriber.py`](src/agents/transcriber.py) |
 | **Vault File I/O** | Custom `ObsidianVaultWriter` with `filelock.FileLock` | [`src/vault/md_writer.py`](src/vault/md_writer.py) |
 | **Git Engine** | `gitpython`, SSH private key auth | [`src/vault/git_engine.py`](src/vault/git_engine.py) |
@@ -335,6 +335,7 @@ GIT_BRANCH=main
 - **Public HTTPS Endpoint** (ngrok, Cloudflare Tunnel, or VPS with reverse proxy for Telegram webhooks)
 - **LLM Backend** (one of the following):
   - **Antigravity CLI (`agy`)** — external CLI binary invoked as a host subprocess (default)
+  - **OpenRouter** — hosted models over HTTPS, including free models; needs an API key from [openrouter.ai/keys](https://openrouter.ai/keys)
   - **Ollama** — for self-hosted local model endpoints (`http://localhost:11434`)
   - **Mock LLM** — built-in stub for headless testing and development
 
@@ -356,7 +357,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 
 # 3. Install dependencies
-pip install -r requirements.txt
+pip install -r requirements.txt -c constraints.txt
 
 # 4. Create local configuration file
 cp .env.example .env.local
@@ -385,7 +386,7 @@ All configuration is managed through [`src/config.py`](src/config.py) using `pyd
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | API token from @BotFather for Telegram bot interactions. |
 | `TELEGRAM_SECRET_TOKEN` | Secret token string used to authenticate incoming webhook requests from Telegram. |
-| `ALLOWED_TELEGRAM_USER_IDS` | Comma-separated list of authorized Telegram user/chat IDs (security whitelist). |
+| `ALLOWED_TELEGRAM_USER_IDS` | Authorized Telegram user/chat IDs (security whitelist): `123`, `123,456`, or `[123,456]`. |
 | `GIT_REPO_URL` | SSH URL for your private Obsidian vault Git repository (`git@github.com:...`). |
 
 ### Optional Core Settings
@@ -395,14 +396,22 @@ All configuration is managed through [`src/config.py`](src/config.py) using `pyd
 | `VAULT_PATH` | `./vault` | Local filesystem path to the Obsidian vault directory. |
 | `SSH_KEY_PATH` | `None` | Path to the private SSH key file (e.g. `./secrets/pkm_deploy_key`). |
 | `GIT_BRANCH` | `main` | Target branch name for vault Git synchronization. |
+| `GIT_SYNC_INTERVAL_MINUTES` | `15` | How often to retry pushing vault commits that are not on the remote yet. `0` disables it. |
 | `QDRANT_STORAGE_PATH` | `./qdrant_storage` | Local directory for embedded Qdrant (zero Docker dependency). Set to empty string for remote mode. |
 | `QDRANT_HOST` | `localhost` | Remote Qdrant server host (used only when `QDRANT_STORAGE_PATH` is empty). |
 | `QDRANT_PORT` | `6333` | Remote Qdrant server port. |
 | `QDRANT_COLLECTION_NAME` | `pkm_notes` | Collection name for vector storage. |
-| `LLM_PROVIDER` | `antigravity` | LLM backend: `antigravity` (calls `agy` CLI), `ollama`, or `mock`. |
+| `LLM_PROVIDER` | `antigravity` | LLM backend: `antigravity` (calls `agy` CLI), `openrouter`, `ollama`, or `mock`. |
 | `AGY_PATH` | `None` (auto-detected) | Explicit path to the `agy` CLI binary if not in standard PATH. |
 | `LLM_MODEL` | `None` | Model tag passed to `agy` (e.g., `flash`, `pro`). |
 | `LLM_EFFORT` | `None` | Reasoning effort for `agy`: `low`, `medium`, or `high`. |
+| `OPENROUTER_API_KEY` | (empty) | OpenRouter API key. Required when `LLM_PROVIDER=openrouter`. |
+| `OPENROUTER_MODEL` | `nvidia/nemotron-3.5-super-vl:free` | OpenRouter model ID. Free models end in `:free` and change often. |
+| `OPENROUTER_FALLBACK_MODELS` | (empty) | Comma-separated model IDs OpenRouter may use when the main model is unavailable. |
+| `OPENROUTER_DATA_COLLECTION` | `deny` | `deny` only routes to providers that do not store or train on your prompts; requests fail instead of leaking. `allow` permits them. |
+| `OPENROUTER_REASONING` | `False` | Let reasoning models think before answering. Off keeps captures fast. |
+| `OPENROUTER_TEMPERATURE` | `0.0` | Sampling temperature for OpenRouter. |
+| `OPENROUTER_TIMEOUT_SECONDS` | `120` | Request timeout for OpenRouter calls. |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server API base URL. |
 | `OLLAMA_MODEL` | `llama3.2` | Model name for Ollama inference. |
 | `OLLAMA_THINK` | `False` | Let Ollama models that support thinking use it. |
@@ -629,7 +638,7 @@ cd pkm-agent
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
-pip install -r requirements.txt
+pip install -r requirements.txt -c constraints.txt
 ```
 
 #### 4. Install the SSH Deploy Key
@@ -823,7 +832,7 @@ curl -s "http://127.0.0.1:8000/health"
 - **Background Concurrency:** `MAX_BACKGROUND_JOBS=1` is the recommended default setting for 2 vCPU / 4 GB servers to prevent memory and CPU starvation during reindexing.
 - **Reranker Resource Overhead:** CrossEncoder reranking is disabled by default to reduce memory footprint and latency; enabling it adds additional model memory and inference latency; actual RAM impact depends on the CrossEncoder/runtime configuration.
 - **Host Resource Variance:** Total RAM consumption depends heavily on the selected LLM provider (external CLI vs local Ollama), Whisper model size, vault size, and active reranker state.
-- **Git Synchronization Scope:** Assumes a single primary writer and logs a `GitConflictError` upon encountering merge collisions during `pull --rebase`, requiring manual intervention.
+- **Git Synchronization Scope:** Assumes a single primary writer. The agent pulls only when a push is rejected, so edits made on other devices reach the server with the next push. A merge conflict stops pushing until it is resolved by hand; the owner is alerted on Telegram.
 - **Knowledge Graph Scope:** The knowledge graph is WikiLink-driven and used for 1-hop retrieval expansion rather than deep multi-hop graph-native reasoning.
 - **Benchmark Generalization:** Evaluation benchmark scores depend directly on the structure, linking density, and content of the indexed vault.
 
@@ -838,7 +847,10 @@ curl -s "http://127.0.0.1:8000/health"
 - **Embedding Dimension Integrity:** Vector collections in Qdrant are locked to the dimension of `EMBEDDING_MODEL_NAME` (e.g. 384 for `all-MiniLM-L6-v2`). Changing models against an existing collection raises a `ValueError` to prevent index corruption. To migrate models, clear `./qdrant_storage` and run `python main.py reindex --force`.
 - **Task Serialization:** `MAX_BACKGROUND_JOBS=1` strictly serializes indexing, Git sync, and consolidation via a semaphore to prevent CPU/RAM contention on low-resource instances.
 - **Whisper Memory Management:** The `faster-whisper` model loads lazily on the first audio memo and unloads after `WHISPER_IDLE_TIMEOUT_SECONDS` (180s) of inactivity to free RAM for query retrieval.
-- **Git Merge Conflict Handling:** The Git engine uses `pull --rebase` after a rejected push. If upstream changes conflict with local writes, the rebase is aborted and the conflict is logged.
+- **Git Merge Conflict Handling:** The Git engine uses `pull --rebase` after a rejected push. If upstream changes conflict with local writes, the rebase is aborted and local commits are kept.
+- **Vault Backup Alerts:** When a push fails (unreachable remote, rejected key, or conflict), the owner gets a Telegram alert naming the reason and how many commits exist only on the server. The alert repeats once a day while the failure lasts, and a second message confirms recovery. Pending pushes are retried every `GIT_SYNC_INTERVAL_MINUTES`. `/health` and `python main.py health` show the unpushed commit count.
+- **Pinned Dependencies:** Install with `-c constraints.txt`. Unpinned installs currently pull `av` 19, which breaks voice transcription in `faster-whisper` 1.2.1.
+- **OpenRouter Privacy:** Free models change often and some providers log or train on prompts. With the default `OPENROUTER_DATA_COLLECTION=deny`, a model with no privacy-safe provider fails with an error instead of receiving your notes. Free models are limited to 50 requests a day, or 1,000 after a one-time purchase of $10 in credits.
 - **LLM Availability:** If the configured LLM provider is unavailable, the server refuses to start and `/health` returns HTTP 503. This checks that the provider can be set up, not that its login or API access is still valid. Run `python main.py health` to see the active LLM driver.
 - **Raw Capture Log:** The exact text of every capture is appended to `.pkm_state/captures/YYYY-MM.jsonl` in the vault before LLM processing, and is committed with the vault. `/reset` deletes it along with your notes.
 - **Wrongly Filed Tasks:** Task confirmations include a **Not a task** button that moves the entry to the Log section and records the correction in the capture log. It leaves the entry alone if the task changed since capture, and it covers the 200 most recent tasks.
@@ -884,6 +896,7 @@ pytest tests/test_task_system.py -v
 pkm-agent/
 ├── main.py                    # Root entrypoint delegating to CLI / FastAPI server
 ├── requirements.txt           # Python package dependencies
+├── constraints.txt            # Exact versions verified together (install with -c)
 ├── pytest.ini                 # Pytest test execution configuration
 ├── .env.example               # Template environment configuration
 ├── LICENSE                    # MIT License
@@ -919,6 +932,7 @@ pkm-agent/
 │   │   ├── base.py            # Abstract Base Class for LLM providers
 │   │   ├── factory.py         # Factory function selecting active LLM backend
 │   │   ├── antigravity_llm.py # AntigravityLLM: wrapper for local agy CLI subprocess
+│   │   ├── openrouter_llm.py  # OpenRouterLLM: HTTPS client for OpenRouter models
 │   │   ├── ollama_llm.py      # OllamaLLM: HTTP client for self-hosted Ollama server
 │   │   └── mock_llm.py        # MockLLM: deterministic test stub
 │   │
@@ -961,16 +975,13 @@ A few pragmatic features and quality-of-life improvements planned for this proje
 ### 2. 💬 Multi-Turn Follow-Up Questions in Telegram
 - Cache the last 2–3 query interactions in memory per chat session so you can ask follow-up questions (e.g., *"Can you give a concrete code example for the second step?"*) without having to repeat the whole prompt.
 
-### 3. 🔔 Telegram Notifications for Git Sync Conflicts
-- When a Git merge or rebase conflict occurs (e.g. if the same note was edited simultaneously on a laptop and phone), send an instant alert to Telegram with the conflicting file name rather than having to check VPS logs via SSH.
-
-### 4. 🔘 Inline Disambiguation for Ambiguous Queries
+### 3. 🔘 Inline Disambiguation for Ambiguous Queries
 - When a search query matches multiple distinct notes across different projects (e.g. searching "deployment" matches both homelab and cloud notes), return interactive inline buttons asking which note to focus on before synthesizing the answer.
 
-### 5. 📊 Expanded Vault-Specific Evaluation Dataset
+### 4. 📊 Expanded Vault-Specific Evaluation Dataset
 - Expand [`src/evaluation/sample_dataset.json`](src/evaluation/sample_dataset.json) with actual domain queries sampled from your vault to systematically evaluate Recall@K, latency, and reranking tradeoffs on personal notes.
 
-### 6. 🛠️ Systemd Service Template & One-Line Launch Script
+### 5. 🛠️ Systemd Service Template & One-Line Launch Script
 - Include a pre-configured `systemd` service template and a `scripts/start.sh` daemon manager to make running the agent as a resilient background service on a personal VPS seamless without container overhead.
 
 [Back to top ↑](#pkm-ai-agent--second-brain-via-telegram)

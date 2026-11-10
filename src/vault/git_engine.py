@@ -4,8 +4,10 @@ import asyncio
 from contextlib import asynccontextmanager, contextmanager
 import logging
 from pathlib import Path
+import re
 import shlex
 import threading
+import time
 from typing import Any, Generator
 import git
 from git.exc import GitCommandError, InvalidGitRepositoryError, NoSuchPathError
@@ -15,6 +17,21 @@ logger = logging.getLogger(__name__)
 
 # Agent-generated files that must never enter vault history.
 INTERNAL_IGNORE_PATTERNS = (".vault_hashes.json", "*.lock", ".*.tmp")
+
+# While the backup keeps failing, remind the owner this often.
+SYNC_ALERT_REPEAT_SECONDS = 24 * 60 * 60
+MAX_ERROR_CHARS = 300
+
+
+def _short_error(err: Exception) -> str:
+    """Reduce a Git error to one short line that is safe to show in a chat message."""
+    text = str(err)
+    stderr = re.search(r"stderr: '(.*)'", text, re.DOTALL)
+    if stderr:
+        text = stderr.group(1)
+    text = re.sub(r"://[^/@\s]+@", "://***@", text)
+    text = " ".join(text.split())
+    return text[:MAX_ERROR_CHARS] or type(err).__name__
 
 
 def get_ssh_command(ssh_key_path: str | Path | None = None) -> str:
@@ -59,6 +76,10 @@ class GitEngine:
         self._thread_lock = threading.RLock()
         self._async_lock: asyncio.Lock | None = None
         self._alerts: list[str] = []
+        self._sync_failing = False
+        self._last_sync_error: str | None = None
+        self._last_pull_error: str | None = None
+        self._last_failure_alert_at: float | None = None
 
     def pop_alerts(self) -> list[str]:
         """Return and clear warnings that should be shown to the vault owner."""
@@ -280,10 +301,12 @@ class GitEngine:
                     res = self.repo.git.pull(origin_name, self.branch)
 
                 logger.info("Successfully pulled latest vault changes: %s", res)
+                self._last_pull_error = None
                 return True
 
             except GitCommandError as err:
                 logger.warning("Git rebase pull encountered conflict or error: %s", err)
+                self._last_pull_error = f"pull failed: {_short_error(err)}"
                 try:
                     self.repo.git.update_environment(GIT_SSH_COMMAND=self.ssh_command)
                     conflicts = self.get_conflicting_files()
@@ -291,6 +314,9 @@ class GitEngine:
 
                     if conflicts:
                         logger.error("⚠️ Vault synchronization conflict detected in files: %s", conflicts)
+                        self._last_pull_error = (
+                            "the remote has conflicting edits to " + ", ".join(sorted(conflicts))
+                        )
                         return False
 
                     # Fallback: attempt standard pull without rebase
@@ -299,13 +325,16 @@ class GitEngine:
                     origin_name = "origin" if "origin" in remote_names else remote_names[0]
                     res = self.repo.git.pull(origin_name, self.branch)
                     logger.info("Fallback pull succeeded: %s", res)
+                    self._last_pull_error = None
                     return True
                 except Exception as fallback_err:
                     logger.exception("Fallback git pull also failed: %s", fallback_err)
+                    self._last_pull_error = f"pull failed: {_short_error(fallback_err)}"
                     return False
 
             except Exception as err:
                 logger.exception("Unexpected error during git pull: %s", err)
+                self._last_pull_error = f"pull failed: {_short_error(err)}"
                 return False
 
     def _alert_on_mass_deletion(self) -> None:
@@ -375,6 +404,101 @@ class GitEngine:
                 logger.exception("Unexpected error during git commit: %s", err)
                 return False
 
+    def _push_with_retry(self) -> tuple[bool, str | None]:
+        """Push to origin, pulling with rebase once if the remote has newer commits.
+
+        Returns:
+            (success, reason for failure or None).
+        """
+        try:
+            res = self.repo.git.push("origin", self.branch)
+            logger.info("Git push output: %s", res)
+            return True, None
+        except GitCommandError as e:
+            if "fetch first" not in str(e) and "non-fast-forward" not in str(e):
+                logger.error("Git push failed: %s", e, exc_info=True)
+                return False, f"push failed: {_short_error(e)}"
+        except Exception as e:
+            logger.error("Git push failed: %s", e, exc_info=True)
+            return False, f"push failed: {_short_error(e)}"
+
+        logger.warning("Git push rejected (fetch first). Pulling and retrying...")
+        if not self.pull_sync(rebase=True, autostash=True):
+            logger.error("Git pull failed during push fallback.")
+            return False, self._last_pull_error or "pull before push failed"
+        try:
+            res = self.repo.git.push("origin", self.branch)
+            logger.info("Git push output after pull: %s", res)
+            return True, None
+        except Exception as e:
+            logger.error("Git push failed after pull: %s", e, exc_info=True)
+            return False, f"push failed after pull: {_short_error(e)}"
+
+    def unpushed_commit_count(self) -> int | None:
+        """Count local commits that are not on the remote branch, as of the last fetch or push.
+
+        Returns:
+            0 when no remote is configured, or None if the count cannot be determined.
+        """
+        with self._thread_lock:
+            try:
+                if not self.repo.remotes:
+                    return 0
+                remote_names = [r.name for r in self.repo.remotes]
+                origin_name = "origin" if "origin" in remote_names else remote_names[0]
+                remote_ref = f"refs/remotes/{origin_name}/{self.branch}"
+                try:
+                    self.repo.git.rev_parse("--verify", "--quiet", remote_ref)
+                except GitCommandError:
+                    # Nothing has reached the remote branch yet.
+                    return int(self.repo.git.rev_list("--count", "HEAD"))
+                return int(self.repo.git.rev_list("--count", f"{remote_ref}..HEAD"))
+            except Exception as err:
+                logger.warning("Could not count unpushed commits: %s", err)
+                return None
+
+    def sync_status(self) -> dict[str, Any]:
+        """Report backup health without creating a repository if none exists."""
+        if not (self.vault_path / ".git").exists():
+            return {"remote_configured": False, "unpushed_commits": None, "failing": False, "last_error": None}
+        with self._thread_lock:
+            return {
+                "remote_configured": bool(self.repo.remotes),
+                "unpushed_commits": self.unpushed_commit_count(),
+                "failing": self._sync_failing,
+                "last_error": self._last_sync_error,
+            }
+
+    def _record_sync_result(self, ok: bool, reason: str | None) -> None:
+        """Track backup health and queue an alert when it starts failing, keeps failing for a day, or recovers."""
+        if ok:
+            if self._sync_failing:
+                logger.info("Vault backup recovered.")
+                self._alerts.append("Vault backup recovered: everything on this server is pushed again.")
+            self._sync_failing = False
+            self._last_sync_error = None
+            self._last_failure_alert_at = None
+            return
+
+        self._sync_failing = True
+        self._last_sync_error = reason or "unknown error"
+        now = time.monotonic()
+        if (
+            self._last_failure_alert_at is not None
+            and now - self._last_failure_alert_at < SYNC_ALERT_REPEAT_SECONDS
+        ):
+            return
+        self._last_failure_alert_at = now
+        pending = self.unpushed_commit_count()
+        pending_text = "unknown" if pending is None else str(pending)
+        logger.error("Vault backup failing (%s); unpushed commits: %s", self._last_sync_error, pending_text)
+        self._alerts.append(
+            f"Vault backup is failing: {self._last_sync_error}. "
+            f"Commits that exist only on this server: {pending_text}. "
+            "Your notes are still saved here; they will be pushed once the remote is reachable "
+            "or the conflict is resolved."
+        )
+
     def push_sync(self) -> bool:
         """Push committed changes to remote repository synchronously.
 
@@ -389,33 +513,13 @@ class GitEngine:
                     logger.info("No remote repositories configured for push; skipping.")
                     return True
 
-                try:
-                    res = self.repo.git.push("origin", self.branch)
-                    logger.info("Git push output: %s", res)
-                    return True
-                except GitCommandError as e:
-                    if 'fetch first' in str(e) or 'non-fast-forward' in str(e):
-                        logger.warning("Git push rejected (fetch first). Pulling and retrying...")
-                        try:
-                            pull_ok = self.pull_sync(rebase=True, autostash=True)
-                            if not pull_ok:
-                                logger.error("Git pull failed during push fallback.")
-                                return False
-                            res = self.repo.git.push("origin", self.branch)
-                            logger.info("Git push output after pull: %s", res)
-                            return True
-                        except Exception as inner_e:
-                            logger.error("Git pull and push failed: %s", inner_e, exc_info=True)
-                            return False
-                    else:
-                        logger.error("Git push failed: %s", e, exc_info=True)
-                        return False
-                except Exception as e:
-                    logger.error("Git push failed: %s", e, exc_info=True)
-                    return False
+                ok, reason = self._push_with_retry()
+                self._record_sync_result(ok, reason)
+                return ok
 
             except Exception as err:
                 logger.error("Git push failed: %s", err, exc_info=True)
+                self._record_sync_result(False, f"push failed: {_short_error(err)}")
                 return False
 
     def commit_and_push_sync(self, commit_message: str, expected_mass_deletion: bool = False) -> bool:
@@ -431,39 +535,20 @@ class GitEngine:
                 commit_ok = self._safe_commit(commit_message)
                 if not commit_ok:
                     logger.error("Failed to commit changes in vault repository.")
+                    self._record_sync_result(False, "commit failed; see server logs")
                     return False
 
                 if not self.repo.remotes:
                     logger.info("No remote repositories configured for push; skipping push.")
                     return True
 
-                try:
-                    res = self.repo.git.push("origin", self.branch)
-                    logger.info("Git push output: %s", res)
-                    return True
-                except GitCommandError as e:
-                    if 'fetch first' in str(e) or 'non-fast-forward' in str(e):
-                        logger.warning("Git push rejected (fetch first). Pulling and retrying...")
-                        try:
-                            pull_ok = self.pull_sync(rebase=True, autostash=True)
-                            if not pull_ok:
-                                logger.error("Git pull failed during push fallback.")
-                                return False
-                            res = self.repo.git.push("origin", self.branch)
-                            logger.info("Git push output after pull: %s", res)
-                            return True
-                        except Exception as inner_e:
-                            logger.error("Git pull and push failed: %s", inner_e, exc_info=True)
-                            return False
-                    else:
-                        logger.error("Git push failed: %s", e, exc_info=True)
-                        return False
-                except Exception as e:
-                    logger.error("Git push failed: %s", e, exc_info=True)
-                    return False
+                ok, reason = self._push_with_retry()
+                self._record_sync_result(ok, reason)
+                return ok
 
             except Exception as err:
                 logger.error("Git commit and push failed: %s", err, exc_info=True)
+                self._record_sync_result(False, f"sync error: {_short_error(err)}")
                 return False
 
     @asynccontextmanager

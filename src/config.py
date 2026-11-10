@@ -1,8 +1,9 @@
 """Configuration settings for PKM AI Agent using pydantic-settings."""
 
 from functools import lru_cache
+from typing import Annotated
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -43,6 +44,11 @@ class Settings(BaseSettings):
         default=None,
         description="Path to SSH private key used for Git repository operations (e.g. ~/.ssh/id_ed25519).",
     )
+    GIT_SYNC_INTERVAL_MINUTES: int = Field(
+        default=15,
+        ge=0,
+        description="How often to retry pushing vault commits that are not yet on the remote. 0 disables it.",
+    )
     VAULT_PATH: str = Field(
         default="./vault",
         description="Path to local Obsidian vault directory.",
@@ -60,7 +66,8 @@ class Settings(BaseSettings):
         description="Port number for Qdrant vector database server.",
     )
 
-    ALLOWED_TELEGRAM_USER_IDS: list[int] = Field(
+    # NoDecode passes the raw text to the validator below; without it "123,456" fails as invalid JSON.
+    ALLOWED_TELEGRAM_USER_IDS: Annotated[list[int], NoDecode] = Field(
         default_factory=list,
         description="Whitelisted Telegram user IDs permitted to interact with the PKM agent.",
     )
@@ -170,7 +177,7 @@ class Settings(BaseSettings):
     # LLM Provider Abstraction
     LLM_PROVIDER: str = Field(
         default="antigravity",
-        description="Active LLM provider backend ('antigravity', 'ollama', 'mock').",
+        description="Active LLM provider backend ('antigravity', 'ollama', 'openrouter', 'mock').",
     )
     AGY_PATH: str | None = Field(
         default=None,
@@ -208,6 +215,40 @@ class Settings(BaseSettings):
         default=0.0,
         ge=0.0,
         description="Sampling temperature for Ollama. 0 gives the most repeatable answers.",
+    )
+
+    OPENROUTER_API_KEY: str = Field(
+        default="",
+        description="OpenRouter API key. Required when LLM_PROVIDER=openrouter.",
+    )
+    OPENROUTER_MODEL: str = Field(
+        default="nvidia/nemotron-3.5-super-vl:free",
+        description="OpenRouter model ID. Free models end in ':free' and change often; check openrouter.ai/models.",
+    )
+    OPENROUTER_FALLBACK_MODELS: str = Field(
+        default="",
+        description="Comma-separated model IDs OpenRouter may use when the main model is unavailable.",
+    )
+    OPENROUTER_DATA_COLLECTION: str = Field(
+        default="deny",
+        description="'deny' only uses providers that do not store or train on your prompts. 'allow' permits them.",
+    )
+    OPENROUTER_REASONING: bool = Field(
+        default=False,
+        description="Whether reasoning models should think before answering. Off keeps captures fast.",
+    )
+    OPENROUTER_TEMPERATURE: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="Sampling temperature for OpenRouter. 0 gives the most repeatable answers.",
+    )
+    OPENROUTER_TIMEOUT_SECONDS: int = Field(
+        default=120,
+        description="Request timeout in seconds for OpenRouter calls.",
+    )
+    OPENROUTER_BASE_URL: str = Field(
+        default="https://openrouter.ai/api/v1",
+        description="OpenRouter API base URL.",
     )
 
     # Audio Transcription & Watcher

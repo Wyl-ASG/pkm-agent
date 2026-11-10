@@ -10,6 +10,7 @@ from src.llm.antigravity_llm import AntigravityLLM
 from src.llm.base import LLMProvider
 from src.llm.mock_llm import MockLLM
 from src.llm.ollama_llm import OllamaLLM
+from src.llm.openrouter_llm import OpenRouterLLM
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,29 @@ def get_llm_provider(
         temperature = kwargs.get("temperature", getattr(settings, "OLLAMA_TEMPERATURE", 0.0))
         return OllamaLLM(base_url=base_url, model=model, think=think, temperature=temperature)
 
+    if selected == "openrouter":
+        fallbacks = [m.strip() for m in settings.OPENROUTER_FALLBACK_MODELS.split(",") if m.strip()]
+        try:
+            provider = OpenRouterLLM(
+                api_key=settings.OPENROUTER_API_KEY,
+                model=kwargs.get("model", settings.OPENROUTER_MODEL),
+                fallback_models=fallbacks,
+                base_url=settings.OPENROUTER_BASE_URL,
+                timeout=settings.OPENROUTER_TIMEOUT_SECONDS,
+                temperature=settings.OPENROUTER_TEMPERATURE,
+                data_collection=settings.OPENROUTER_DATA_COLLECTION,
+                reasoning=settings.OPENROUTER_REASONING,
+            )
+        except ValueError as err:
+            raise LLMUnavailableError(f"LLM_PROVIDER=openrouter is configured but unavailable: {err}") from err
+        logger.info(
+            "Initializing OpenRouter LLM provider (model=%s, fallbacks=%d, data_collection=%s)",
+            provider.model,
+            len(provider.fallback_models),
+            provider.data_collection,
+        )
+        return provider
+
     if selected == "mock":
         logger.warning("Using MockLLM: all LLM output is fake. This is only for tests and development.")
         return MockLLM(**kwargs)
@@ -70,7 +94,7 @@ def get_llm_provider(
             ) from err
 
     raise LLMUnavailableError(
-        f"Unknown LLM_PROVIDER '{selected}'. Use 'antigravity', 'ollama', or 'mock'."
+        f"Unknown LLM_PROVIDER '{selected}'. Use 'antigravity', 'ollama', 'openrouter', or 'mock'."
     )
 
 

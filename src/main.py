@@ -192,15 +192,27 @@ async def lifespan(app: FastAPI):
 
     watchdog_task = asyncio.create_task(memory_watchdog())
 
+    # 6. Retry pending vault pushes so a failed backup is noticed and recovered without a new capture
+    backup_task: asyncio.Task | None = None
+    if settings.GIT_REPO_URL and settings.GIT_SYNC_INTERVAL_MINUTES > 0:
+        backup_task = asyncio.create_task(
+            vault_backup_scheduler(interval_seconds=settings.GIT_SYNC_INTERVAL_MINUTES * 60)
+        )
+
     yield
 
     logger.info("FastAPI application shutting down...")
     scheduler_task.cancel()
     watchdog_task.cancel()
-    try:
-        await scheduler_task
-    except asyncio.CancelledError:
-        pass
+    if backup_task:
+        backup_task.cancel()
+    for task in (scheduler_task, backup_task):
+        if task is None:
+            continue
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     if vault_watcher:
         vault_watcher.stop()
@@ -339,6 +351,24 @@ async def _commit_and_send_alerts(commit_msg: str, expected_mass_deletion: bool 
     for alert in git_engine.pop_alerts():
         for chat_id in settings.ALLOWED_TELEGRAM_USER_IDS:
             await send_telegram_message(chat_id, f"⚠️ {alert}")
+
+
+async def run_scheduled_vault_backup() -> None:
+    """Commit anything left uncommitted, retry pending pushes, and send any backup alerts."""
+    async with resource_manager.background_job_semaphore:
+        await _commit_and_send_alerts("Vault update: scheduled backup")
+
+
+async def vault_backup_scheduler(interval_seconds: float, first_delay_seconds: float = 60.0) -> None:
+    """Run the vault backup shortly after startup and then on a fixed interval."""
+    logger.info("Vault backup retry scheduled every %.0f minutes.", interval_seconds / 60)
+    await asyncio.sleep(first_delay_seconds)
+    while True:
+        try:
+            await run_scheduled_vault_backup()
+        except Exception as err:
+            logger.exception("Scheduled vault backup failed: %s", err)
+        await asyncio.sleep(interval_seconds)
 
 
 async def _safe_git_commit_and_push(commit_msg: str) -> None:
@@ -682,6 +712,7 @@ async def health_check() -> JSONResponse:
     metrics = resource_monitor.get_metrics()
     active_llm = _active_llm_name()
     qdrant_status = await asyncio.to_thread(_qdrant_status)
+    vault_backup = await asyncio.to_thread(git_engine.sync_status)
     is_healthy = active_llm is not None and qdrant_status == "ok"
     payload = {
         "status": "healthy" if is_healthy else "degraded",
@@ -725,6 +756,7 @@ async def health_check() -> JSONResponse:
             "bm25": {
                 "indexed_chunks": len(bm25_index.documents),
             },
+            "vault_backup": vault_backup,
         },
     }
     return JSONResponse(content=payload, status_code=200 if is_healthy else 503)
@@ -1201,6 +1233,13 @@ def print_health_report() -> None:
 
     git_stat = git_engine.check_working_tree()
     print(f"Git Working Tree:      {'DIRTY' if git_stat.get('is_dirty') else 'CLEAN'} ({len(git_stat.get('modified', []))} modified, {len(git_stat.get('conflicts', []))} conflicts)")
+    backup = git_engine.sync_status()
+    if not backup["remote_configured"]:
+        print("Vault Backup:          NO REMOTE (notes exist only on this machine)")
+    else:
+        pending = backup["unpushed_commits"]
+        pending_text = "UNKNOWN" if pending is None else f"{pending} unpushed commit(s)"
+        print(f"Vault Backup:          {pending_text} (as of the last fetch or push)")
     print("=" * 60)
 
 
